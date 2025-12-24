@@ -1,0 +1,71 @@
+"use client";
+import { useEffect, useState } from "react";
+import Shell from "../../../components/Shell";
+import Filters, { FiltersValue } from "../../../components/Filters";
+import { apiFetch } from "../../../lib/api";
+
+export default function ProgressPage() {
+  const [filters, setFilters] = useState<FiltersValue>(() => {
+    const today = new Date();
+    const start = new Date(today.getFullYear(), today.getMonth(), 1);
+    const iso = (d: Date) => d.toISOString().slice(0, 10);
+    return { projectId: 1, dateFrom: iso(start), dateTo: iso(today), wbsPath: "" };
+  });
+  const [by, setBy] = useState<"wbs"|"discipline"|"block"|"floor"|"ugpr">("discipline");
+  const [table, setTable] = useState<any>(null);
+
+  async function load(v: FiltersValue, byKey = by) {
+    const wbs = v.wbsPath ? `&wbs_path=${encodeURIComponent(v.wbsPath)}` : "";
+    const q = `?project_id=${v.projectId}&date_from=${v.dateFrom}&date_to=${v.dateTo}&by=${byKey}${wbs}`;
+    const t = await apiFetch(`/reports/plan-fact/table${q}`);
+    setTable(t);
+  }
+
+  useEffect(()=>{ load(filters); }, []);
+
+  return (
+    <Shell title="Прогресс">
+      <div className="flex flex-wrap gap-4 items-end">
+        <Filters initial={filters} onChange={(v)=>{ setFilters(v); load(v); }} />
+        <label className="text-sm">
+          <div className="text-neutral-400 mb-1">Группировка</div>
+          <select className="px-3 py-2 rounded bg-neutral-900 border border-neutral-800"
+            value={by}
+            onChange={(e)=>{ const v=e.target.value as any; setBy(v); load(filters, v);} }>
+            <option value="discipline">Дисциплина</option>
+            <option value="wbs">WBS</option>
+            <option value="block">Блок</option>
+            <option value="floor">Этаж</option>
+            <option value="ugpr">УГПР</option>
+          </select>
+        </label>
+      </div>
+
+      <div className="mt-4 rounded-xl bg-neutral-900 border border-neutral-800 overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-neutral-950/60 text-neutral-300">
+            <tr>
+              <th className="text-left px-3 py-2">Группа</th>
+              <th className="text-right px-3 py-2">План</th>
+              <th className="text-right px-3 py-2">Факт</th>
+              <th className="text-right px-3 py-2">Отклонение</th>
+              <th className="text-right px-3 py-2">Прогресс %</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(table?.rows || []).slice(0,50).map((r:any)=>(
+              <tr key={r.key} className="border-t border-neutral-800">
+                <td className="px-3 py-2">{r.key}</td>
+                <td className="px-3 py-2 text-right">{r.plan.toFixed(2)}</td>
+                <td className="px-3 py-2 text-right">{r.fact.toFixed(2)}</td>
+                <td className="px-3 py-2 text-right">{r.variance.toFixed(2)}</td>
+                <td className="px-3 py-2 text-right">{r.progress_pct.toFixed(1)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="text-xs text-neutral-500 mt-2">План по группам распределён пропорционально факту (MVP). Для точного плана по WBS/дисциплине нужен план с детализацией по операциям.</div>
+    </Shell>
+  );
+}

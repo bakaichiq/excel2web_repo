@@ -1,0 +1,58 @@
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: excel2web
+      POSTGRES_USER: excel2web
+      POSTGRES_PASSWORD: excel2web
+    ports: ["5432:5432"]
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+
+  backend:
+    build: ../backend
+    environment:
+      ENV: dev
+      DATABASE_URL: postgresql+psycopg2://excel2web:excel2web@db:5432/excel2web
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: dev-secret-change
+      CORS_ORIGINS: http://localhost:3000
+      UPLOAD_DIR: /data/uploads
+      EXPORT_DIR: /data/exports
+      SEED_DEMO: "true"
+      DEMO_ADMIN_LOGIN: admin
+      DEMO_ADMIN_PASSWORD: admin123
+    depends_on: [db, redis]
+    ports: ["8000:8000"]
+    volumes:
+      - app_data:/data
+
+  worker:
+    build: ../backend
+    command: celery -A app.worker.celery_app.celery_app worker -l INFO
+    environment:
+      ENV: dev
+      DATABASE_URL: postgresql+psycopg2://excel2web:excel2web@db:5432/excel2web
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: dev-secret-change
+      UPLOAD_DIR: /data/uploads
+      EXPORT_DIR: /data/exports
+    depends_on: [backend, redis, db]
+    volumes:
+      - app_data:/data
+
+  frontend:
+    build: ../frontend
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+    depends_on: [backend]
+    ports: ["3000:3000"]
+
+volumes:
+  db_data:
+  app_data:

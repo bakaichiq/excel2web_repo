@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+.env.*
+!.env.example
+backend/.venv/
+backend/app/db/migrations/versions/*.pyc
+backend/app/db/migrations/versions/__pycache__/
+backend/data/uploads/
+backend/data/exports/
+frontend/.next/
+frontend/node_modules/
+infra/pgdata/
+infra/redisdata/
