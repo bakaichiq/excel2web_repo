@@ -12,11 +12,12 @@ export default function ProgressPage() {
     return { projectId: 1, dateFrom: iso(start), dateTo: iso(today), wbsPath: "" };
   });
   const [by, setBy] = useState<"wbs"|"discipline"|"block"|"floor"|"ugpr">("discipline");
+  const [scenario, setScenario] = useState<"plan" | "forecast" | "actual">("plan");
   const [table, setTable] = useState<any>(null);
 
-  async function load(v: FiltersValue, byKey = by) {
+  async function load(v: FiltersValue, byKey = by, sc = scenario) {
     const wbs = v.wbsPath ? `&wbs_path=${encodeURIComponent(v.wbsPath)}` : "";
-    const q = `?project_id=${v.projectId}&date_from=${v.dateFrom}&date_to=${v.dateTo}&by=${byKey}${wbs}`;
+    const q = `?project_id=${v.projectId}&date_from=${v.dateFrom}&date_to=${v.dateTo}&by=${byKey}&scenario=${sc}${wbs}`;
     const t = await apiFetch(`/reports/plan-fact/table${q}`);
     setTable(t);
   }
@@ -37,6 +38,22 @@ export default function ProgressPage() {
             <option value="block">Блок</option>
             <option value="floor">Этаж</option>
             <option value="ugpr">УГПР</option>
+          </select>
+        </label>
+        <label className="text-sm">
+          <div className="text-neutral-400 mb-1">Сценарий</div>
+          <select
+            className="px-3 py-2 rounded bg-neutral-900 border border-neutral-800"
+            value={scenario}
+            onChange={(e) => {
+              const v = e.target.value as "plan" | "forecast" | "actual";
+              setScenario(v);
+              load(filters, by, v);
+            }}
+          >
+            <option value="plan">Plan</option>
+            <option value="forecast">Forecast</option>
+            <option value="actual">Actual</option>
           </select>
         </label>
       </div>
@@ -65,7 +82,9 @@ export default function ProgressPage() {
           </tbody>
         </table>
       </div>
-      <div className="text-xs text-neutral-500 mt-2">План по группам распределён пропорционально факту (MVP). Для точного плана по WBS/дисциплине нужен план с детализацией по операциям.</div>
+      <div className="text-xs text-neutral-500 mt-2">
+        План считается по операциям/ГПР; для forecast используется авто‑прогноз по факту (если явного прогноза нет).
+      </div>
     </Shell>
   );
 }

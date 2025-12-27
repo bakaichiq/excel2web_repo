@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_
 
 from app.db.models.operation import Operation
+from app.db.models.operation_dependency import OperationDependency
 from app.db.models.wbs import WBS
 from app.schemas.operations import OperationCreate, OperationUpdate
 
@@ -117,4 +118,30 @@ def update_operation(db: Session, op: Operation, data: OperationUpdate) -> Opera
 
 def delete_operation(db: Session, op: Operation) -> None:
     db.delete(op)
+    db.commit()
+
+
+def list_dependencies(db: Session, project_id: int):
+    return (
+        db.query(OperationDependency)
+        .filter(OperationDependency.project_id == project_id)
+        .order_by(OperationDependency.id)
+        .all()
+    )
+
+
+def create_dependency(db: Session, project_id: int, predecessor_id: int, successor_id: int) -> OperationDependency:
+    dep = OperationDependency(
+        project_id=project_id,
+        predecessor_id=predecessor_id,
+        successor_id=successor_id,
+    )
+    db.add(dep)
+    db.commit()
+    db.refresh(dep)
+    return dep
+
+
+def delete_dependency(db: Session, dep: OperationDependency) -> None:
+    db.delete(dep)
     db.commit()

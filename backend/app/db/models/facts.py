@@ -1,5 +1,5 @@
 import datetime as dt
-from sqlalchemy import ForeignKey, Date, Float, String, UniqueConstraint
+from sqlalchemy import ForeignKey, Date, Float, String, Index
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -8,7 +8,27 @@ from app.db.models._mixins import TimestampMixin
 class FactVolumeDaily(Base, TimestampMixin):
     __tablename__ = "fact_volume_daily"
     __table_args__ = (
-        UniqueConstraint("project_id", "operation_code", "category", "item_name", "date", name="uq_fact_volume_day"),
+        Index(
+            "uq_fact_volume_day_manual",
+            "project_id",
+            "operation_code",
+            "category",
+            "item_name",
+            "date",
+            unique=True,
+            postgresql_where="import_run_id IS NULL",
+        ),
+        Index(
+            "uq_fact_volume_day_run",
+            "project_id",
+            "import_run_id",
+            "operation_code",
+            "category",
+            "item_name",
+            "date",
+            unique=True,
+            postgresql_where="import_run_id IS NOT NULL",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -34,7 +54,25 @@ class FactVolumeDaily(Base, TimestampMixin):
 class PlanVolumeMonthly(Base, TimestampMixin):
     __tablename__ = "plan_volume_monthly"
     __table_args__ = (
-        UniqueConstraint("project_id", "operation_code", "month", "scenario", name="uq_plan_volume_month"),
+        Index(
+            "uq_plan_volume_month_manual",
+            "project_id",
+            "operation_code",
+            "month",
+            "scenario",
+            unique=True,
+            postgresql_where="import_run_id IS NULL",
+        ),
+        Index(
+            "uq_plan_volume_month_run",
+            "project_id",
+            "import_run_id",
+            "operation_code",
+            "month",
+            "scenario",
+            unique=True,
+            postgresql_where="import_run_id IS NOT NULL",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -51,7 +89,27 @@ class PlanVolumeMonthly(Base, TimestampMixin):
 class FactResourceDaily(Base, TimestampMixin):
     __tablename__ = "fact_resource_daily"
     __table_args__ = (
-        UniqueConstraint("project_id", "resource_name", "category", "date", "scenario", name="uq_res_day"),
+        Index(
+            "uq_res_day_manual",
+            "project_id",
+            "resource_name",
+            "category",
+            "date",
+            "scenario",
+            unique=True,
+            postgresql_where="import_run_id IS NULL",
+        ),
+        Index(
+            "uq_res_day_run",
+            "project_id",
+            "import_run_id",
+            "resource_name",
+            "category",
+            "date",
+            "scenario",
+            unique=True,
+            postgresql_where="import_run_id IS NOT NULL",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -68,7 +126,25 @@ class FactResourceDaily(Base, TimestampMixin):
 class FactPnLMonthly(Base, TimestampMixin):
     __tablename__ = "fact_pnl_monthly"
     __table_args__ = (
-        UniqueConstraint("project_id", "account_name", "month", "scenario", name="uq_pnl_month"),
+        Index(
+            "uq_pnl_month_manual",
+            "project_id",
+            "account_name",
+            "month",
+            "scenario",
+            unique=True,
+            postgresql_where="import_run_id IS NULL",
+        ),
+        Index(
+            "uq_pnl_month_run",
+            "project_id",
+            "import_run_id",
+            "account_name",
+            "month",
+            "scenario",
+            unique=True,
+            postgresql_where="import_run_id IS NOT NULL",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -84,7 +160,25 @@ class FactPnLMonthly(Base, TimestampMixin):
 class FactCashflowMonthly(Base, TimestampMixin):
     __tablename__ = "fact_cashflow_monthly"
     __table_args__ = (
-        UniqueConstraint("project_id", "account_name", "month", "scenario", name="uq_cf_month"),
+        Index(
+            "uq_cf_month_manual",
+            "project_id",
+            "account_name",
+            "month",
+            "scenario",
+            unique=True,
+            postgresql_where="import_run_id IS NULL",
+        ),
+        Index(
+            "uq_cf_month_run",
+            "project_id",
+            "import_run_id",
+            "account_name",
+            "month",
+            "scenario",
+            unique=True,
+            postgresql_where="import_run_id IS NOT NULL",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

@@ -2,7 +2,7 @@ import datetime as dt
 from typing import Literal
 
 from sqlalchemy.orm import Session, aliased
-from sqlalchemy import func, Date, cast, and_
+from sqlalchemy import func, Date, cast, and_, or_
 
 from app.db.models.facts import (
     FactVolumeDaily,
@@ -14,6 +14,7 @@ from app.db.models.facts import (
 from app.db.models.baseline import BaselineVolume
 from app.db.models.operation import Operation
 from app.db.models.wbs import WBS
+from app.db.models.import_run import ImportRun
 
 Granularity = Literal["day", "week", "month"]
 
@@ -45,12 +46,36 @@ def _apply_wbs_fact_filter(q, wbs_path: str | None):
     return q
 
 
+def _latest_import_run_id(db: Session, project_id: int) -> int | None:
+    run = (
+        db.query(ImportRun)
+        .filter(
+            ImportRun.project_id == project_id,
+            ImportRun.status.in_(("success", "success_with_errors")),
+        )
+        .order_by(ImportRun.finished_at.desc().nullslast(), ImportRun.id.desc())
+        .first()
+    )
+    return run.id if run else None
+
+
+def _effective_import_run_id(db: Session, project_id: int, import_run_id: int | None) -> int | None:
+    return import_run_id if import_run_id is not None else _latest_import_run_id(db, project_id)
+
+
+def _apply_import_run_filter(q, model, import_run_id: int | None):
+    if import_run_id is None:
+        return q.filter(model.import_run_id.is_(None))
+    return q.filter(or_(model.import_run_id == import_run_id, model.import_run_id.is_(None)))
+
+
 def _plan_month_rows(
     db: Session,
     project_id: int,
     date_from: dt.date,
     date_to: dt.date,
     scenario: str,
+    import_run_id: int | None = None,
     wbs_path: str | None = None,
 ):
     qry = (
@@ -62,6 +87,7 @@ def _plan_month_rows(
             PlanVolumeMonthly.scenario == scenario,
         )
     )
+    qry = _apply_import_run_filter(qry, PlanVolumeMonthly, import_run_id)
     if wbs_path:
         qry = (
             qry.join(
@@ -82,6 +108,7 @@ def _plan_qty_for_month(
     project_id: int,
     month: dt.date,
     scenario: str,
+    import_run_id: int | None = None,
     wbs_path: str | None = None,
 ):
     qry = (
@@ -92,6 +119,7 @@ def _plan_qty_for_month(
             PlanVolumeMonthly.scenario == scenario,
         )
     )
+    qry = _apply_import_run_filter(qry, PlanVolumeMonthly, import_run_id)
     if wbs_path:
         qry = (
             qry.join(
@@ -107,7 +135,15 @@ def _plan_qty_for_month(
     return qry.scalar() or 0.0
 
 
-def kpi(db: Session, project_id: int, date_from: dt.date, date_to: dt.date, wbs_path: str | None = None):
+def kpi(
+    db: Session,
+    project_id: int,
+    date_from: dt.date,
+    date_to: dt.date,
+    wbs_path: str | None = None,
+    import_run_id: int | None = None,
+):
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
     fact_qty_q = (
         db.query(func.coalesce(func.sum(FactVolumeDaily.qty), 0.0))
         .filter(
@@ -116,9 +152,21 @@ def kpi(db: Session, project_id: int, date_from: dt.date, date_to: dt.date, wbs_
             FactVolumeDaily.date <= date_to,
         )
     )
-    fact_qty = _apply_wbs_fact_filter(fact_qty_q, wbs_path).scalar() or 0.0
+    fact_qty = _apply_import_run_filter(
+        _apply_wbs_fact_filter(fact_qty_q, wbs_path),
+        FactVolumeDaily,
+        import_run_id,
+    ).scalar() or 0.0
 
-    plan_rows = _plan_month_rows(db, project_id, date_from, date_to, "plan", wbs_path=wbs_path)
+    plan_rows = _plan_month_rows(
+        db,
+        project_id,
+        date_from,
+        date_to,
+        "plan",
+        import_run_id=import_run_id,
+        wbs_path=wbs_path,
+    )
 
     plan_qty = 0.0
     for m, qty in plan_rows:
@@ -130,16 +178,15 @@ def kpi(db: Session, project_id: int, date_from: dt.date, date_to: dt.date, wbs_
             overlap_days = (overlap_end - overlap_start).days + 1
             plan_qty += (qty / _month_days(m_start)) * overlap_days
 
-    manhours = (
+    manhours_q = (
         db.query(func.coalesce(func.sum(FactResourceDaily.manhours), 0.0))
         .filter(
             FactResourceDaily.project_id == project_id,
             FactResourceDaily.date >= date_from,
             FactResourceDaily.date <= date_to,
         )
-        .scalar()
-        or 0.0
     )
+    manhours = _apply_import_run_filter(manhours_q, FactResourceDaily, import_run_id).scalar() or 0.0
 
     progress_pct = (fact_qty / plan_qty * 100.0) if plan_qty > 0 else 0.0
     productivity = (fact_qty / manhours) if manhours > 0 else None
@@ -163,7 +210,9 @@ def plan_fact_series(
     date_to: dt.date,
     granularity: Granularity = "month",
     wbs_path: str | None = None,
+    import_run_id: int | None = None,
 ):
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
     # ✅ ВАЖНО: кастим в sqlalchemy.Date
     if granularity == "day":
         period_expr = FactVolumeDaily.date
@@ -181,7 +230,7 @@ def plan_fact_series(
         )
     )
     fact_rows = (
-        _apply_wbs_fact_filter(fact_rows_q, wbs_path)
+        _apply_import_run_filter(_apply_wbs_fact_filter(fact_rows_q, wbs_path), FactVolumeDaily, import_run_id)
         .group_by(period_expr)
         .order_by(period_expr)
         .all()
@@ -191,7 +240,7 @@ def plan_fact_series(
         months = _daterange_month_starts(date_from, date_to)
         daily: dict[dt.date, float] = {}
         for m in months:
-            qty = _plan_qty_for_month(db, project_id, m, scenario, wbs_path=wbs_path)
+            qty = _plan_qty_for_month(db, project_id, m, scenario, import_run_id=import_run_id, wbs_path=wbs_path)
             per_day = (qty / _month_days(m)) if qty else 0.0
             for i in range(_month_days(m)):
                 d = m + dt.timedelta(days=i)
@@ -209,8 +258,12 @@ def plan_fact_series(
         return [(p, out_map[p]) for p in sorted(out_map.keys())]
 
     if granularity == "month":
-        plan_rows = _plan_month_rows(db, project_id, date_from, date_to, "plan", wbs_path=wbs_path)
-        forecast_rows = _plan_month_rows(db, project_id, date_from, date_to, "forecast", wbs_path=wbs_path)
+        plan_rows = _plan_month_rows(
+            db, project_id, date_from, date_to, "plan", import_run_id=import_run_id, wbs_path=wbs_path
+        )
+        forecast_rows = _plan_month_rows(
+            db, project_id, date_from, date_to, "forecast", import_run_id=import_run_id, wbs_path=wbs_path
+        )
     else:
         plan_rows = _daily_rows_for_scenario("plan")
         forecast_rows = _daily_rows_for_scenario("forecast")
@@ -283,8 +336,23 @@ def plan_fact_table_by(
     date_from: dt.date,
     date_to: dt.date,
     by: Literal["wbs", "discipline", "block", "floor", "ugpr"] = "wbs",
+    scenario: Literal["plan", "forecast", "actual"] = "plan",
     wbs_path: str | None = None,
+    import_run_id: int | None = None,
 ):
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
+    def _month_overlap_days(month_start: dt.date) -> int:
+        m_start = month_start
+        m_end = m_start + dt.timedelta(days=_month_days(m_start) - 1)
+        overlap_start = max(date_from, m_start)
+        overlap_end = min(date_to, m_end)
+        if overlap_start > overlap_end:
+            return 0
+        return (overlap_end - overlap_start).days + 1
+
+    def _k(v):
+        return v if v not in (None, "") else "—"
+
     col = getattr(FactVolumeDaily, by)
     fact_rows_q = (
         db.query(col.label("k"), func.coalesce(func.sum(FactVolumeDaily.qty), 0.0).label("fact"))
@@ -294,16 +362,124 @@ def plan_fact_table_by(
             FactVolumeDaily.date <= date_to,
         )
     )
-    fact_rows = _apply_wbs_fact_filter(fact_rows_q, wbs_path).group_by(col).all()
+    fact_rows = (
+        _apply_import_run_filter(_apply_wbs_fact_filter(fact_rows_q, wbs_path), FactVolumeDaily, import_run_id)
+        .group_by(col)
+        .all()
+    )
+    fact_map = {_k(r.k): float(r.fact or 0.0) for r in fact_rows}
 
-    total_fact = sum(float(r.fact or 0.0) for r in fact_rows)
-    plan_total = kpi(db, project_id, date_from, date_to, wbs_path=wbs_path)["plan_qty"]
+    plan_map: dict[str, float] = {}
 
+    if scenario == "actual":
+        plan_map = dict(fact_map)
+    else:
+        plan_scenario = "forecast" if scenario == "forecast" else "plan"
+        month_from = dt.date(date_from.year, date_from.month, 1)
+        month_to = dt.date(date_to.year, date_to.month, 1)
+
+        op_group_col = getattr(Operation, by) if by != "wbs" else None
+
+        qry = db.query(
+            PlanVolumeMonthly.month.label("month"),
+            PlanVolumeMonthly.qty.label("qty"),
+            (WBS.path.label("gk") if by == "wbs" else op_group_col.label("gk")),
+        ).join(
+            Operation,
+            and_(
+                Operation.project_id == PlanVolumeMonthly.project_id,
+                Operation.code == PlanVolumeMonthly.operation_code,
+            ),
+        )
+        if by == "wbs" or wbs_path:
+            qry = qry.outerjoin(WBS, Operation.wbs_id == WBS.id)
+
+        qry = qry.filter(
+            PlanVolumeMonthly.project_id == project_id,
+            PlanVolumeMonthly.scenario == plan_scenario,
+            PlanVolumeMonthly.month >= month_from,
+            PlanVolumeMonthly.month <= month_to,
+        )
+        qry = _apply_import_run_filter(qry, PlanVolumeMonthly, import_run_id)
+        if wbs_path:
+            qry = qry.filter(WBS.path.ilike(f"{wbs_path}%"))
+
+        plan_rows = qry.all()
+        if plan_rows:
+            for r in plan_rows:
+                key = _k(r.gk)
+                days = _month_overlap_days(r.month)
+                if days <= 0:
+                    continue
+                qty = float(r.qty or 0.0)
+                plan_map[key] = plan_map.get(key, 0.0) + (qty / _month_days(r.month)) * days
+
+        if scenario == "forecast" and not plan_map:
+            period_expr = cast(func.date_trunc("month", FactVolumeDaily.date), Date)
+            fact_month_q = (
+                db.query(period_expr.label("period"), col.label("k"), func.coalesce(func.sum(FactVolumeDaily.qty), 0.0).label("fact"))
+                .filter(
+                    FactVolumeDaily.project_id == project_id,
+                    FactVolumeDaily.date >= date_from,
+                    FactVolumeDaily.date <= date_to,
+                )
+            )
+            fact_month_rows = (
+                _apply_import_run_filter(_apply_wbs_fact_filter(fact_month_q, wbs_path), FactVolumeDaily, import_run_id)
+                .group_by(period_expr, col)
+                .all()
+            )
+            months = _daterange_month_starts(date_from, date_to)
+            fact_by_group: dict[str, dict[dt.date, float]] = {}
+            for r in fact_month_rows:
+                key = _k(r.k)
+                fact_by_group.setdefault(key, {})
+                fact_by_group[key][r.period] = float(r.fact or 0.0)
+
+            def _auto_forecast(periods: list[dt.date], fact_map_per: dict[dt.date, float]) -> dict[dt.date, float]:
+                if not periods:
+                    return {}
+                xs = []
+                ys = []
+                for i, p in enumerate(periods):
+                    v = fact_map_per.get(p, 0.0)
+                    if v > 0:
+                        xs.append(float(i))
+                        ys.append(float(v))
+                if not xs:
+                    return {}
+                if len(xs) == 1:
+                    last_val = ys[0]
+                    return {p: last_val for p in periods}
+                n = float(len(xs))
+                sum_x = sum(xs)
+                sum_y = sum(ys)
+                sum_xx = sum(x * x for x in xs)
+                sum_xy = sum(x * y for x, y in zip(xs, ys))
+                denom = (n * sum_xx - sum_x * sum_x)
+                if denom == 0:
+                    last_val = ys[-1]
+                    return {p: last_val for p in periods}
+                a = (n * sum_xy - sum_x * sum_y) / denom
+                b = (sum_y - a * sum_x) / n
+                return {p: float(a * i + b) for i, p in enumerate(periods)}
+
+            for key, fmap in fact_by_group.items():
+                forecast_map = _auto_forecast(months, fmap)
+                if not forecast_map:
+                    continue
+                for m in months:
+                    days = _month_overlap_days(m)
+                    if days <= 0:
+                        continue
+                    qty = forecast_map.get(m, 0.0)
+                    plan_map[key] = plan_map.get(key, 0.0) + (qty / _month_days(m)) * days
+
+    keys = set(fact_map.keys()) | set(plan_map.keys())
     rows = []
-    for r in fact_rows:
-        k = r.k or "—"
-        fact = float(r.fact or 0.0)
-        plan = (plan_total * (fact / total_fact)) if total_fact > 0 else 0.0
+    for k in keys:
+        fact = float(fact_map.get(k, 0.0))
+        plan = float(plan_map.get(k, 0.0))
         variance = fact - plan
         progress = (fact / plan * 100.0) if plan > 0 else 0.0
         rows.append({"key": k, "fact": fact, "plan": plan, "variance": variance, "progress_pct": progress})
@@ -319,7 +495,9 @@ def ugpr_series(
     date_to: dt.date,
     granularity: Granularity = "month",
     wbs_path: str | None = None,
+    import_run_id: int | None = None,
 ):
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
     if granularity == "day":
         period_expr = FactVolumeDaily.date
     elif granularity == "week":
@@ -328,7 +506,7 @@ def ugpr_series(
         period_expr = cast(func.date_trunc("month", FactVolumeDaily.date), Date)
 
     baseline_exact = aliased(BaselineVolume)
-    baseline_cat = (
+    baseline_cat_q = (
         db.query(
             BaselineVolume.project_id.label("project_id"),
             BaselineVolume.operation_code.label("operation_code"),
@@ -336,9 +514,13 @@ def ugpr_series(
             func.coalesce(func.avg(BaselineVolume.price), 0.0).label("price"),
         )
         .filter(BaselineVolume.price.isnot(None))
-        .group_by(BaselineVolume.project_id, BaselineVolume.operation_code, BaselineVolume.category)
-        .subquery()
     )
+    baseline_cat_q = _apply_import_run_filter(baseline_cat_q, BaselineVolume, import_run_id)
+    baseline_cat = baseline_cat_q.group_by(
+        BaselineVolume.project_id,
+        BaselineVolume.operation_code,
+        BaselineVolume.category,
+    ).subquery()
 
     amount_expr = func.coalesce(
         FactVolumeDaily.amount,
@@ -359,6 +541,14 @@ def ugpr_series(
                 FactVolumeDaily.operation_code == baseline_exact.operation_code,
                 FactVolumeDaily.category == baseline_exact.category,
                 FactVolumeDaily.item_name == baseline_exact.item_name,
+                (
+                    baseline_exact.import_run_id.is_(None)
+                    if import_run_id is None
+                    else or_(
+                        baseline_exact.import_run_id == import_run_id,
+                        baseline_exact.import_run_id.is_(None),
+                    )
+                ),
             ),
         )
         .outerjoin(
@@ -375,7 +565,7 @@ def ugpr_series(
             FactVolumeDaily.date <= date_to,
         )
     )
-    qry = _apply_wbs_fact_filter(qry, wbs_path)
+    qry = _apply_import_run_filter(_apply_wbs_fact_filter(qry, wbs_path), FactVolumeDaily, import_run_id)
     rows = qry.group_by(period_expr).order_by(period_expr).all()
 
     out = []
@@ -391,9 +581,11 @@ def ugpr_series(
             func.coalesce(func.avg(BaselineVolume.price), 0.0).label("price"),
         )
         .filter(BaselineVolume.price.isnot(None))
-        .group_by(BaselineVolume.project_id, BaselineVolume.operation_code)
-        .subquery()
     )
+    price_by_op = _apply_import_run_filter(price_by_op, BaselineVolume, import_run_id).group_by(
+        BaselineVolume.project_id,
+        BaselineVolume.operation_code,
+    ).subquery()
 
     plan_month_q = (
         db.query(
@@ -414,6 +606,7 @@ def ugpr_series(
             PlanVolumeMonthly.scenario == "plan",
         )
     )
+    plan_month_q = _apply_import_run_filter(plan_month_q, PlanVolumeMonthly, import_run_id)
     if wbs_path:
         plan_month_q = (
             plan_month_q.join(
@@ -457,20 +650,41 @@ def ugpr_series(
     return {"series": out, "plan": plan_out}
 
 
-def pnl(db: Session, project_id: int, date_from: dt.date, date_to: dt.date, scenario: str = "plan"):
-    rows = (
-        db.query(FactPnLMonthly.month, FactPnLMonthly.account_name, func.sum(FactPnLMonthly.amount))
+def pnl(
+    db: Session,
+    project_id: int,
+    date_from: dt.date,
+    date_to: dt.date,
+    scenario: str = "plan",
+    import_run_id: int | None = None,
+):
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
+    rows_q = (
+        db.query(
+            FactPnLMonthly.month,
+            FactPnLMonthly.account_name,
+            FactPnLMonthly.parent_name,
+            func.sum(FactPnLMonthly.amount),
+        )
         .filter(
             FactPnLMonthly.project_id == project_id,
             FactPnLMonthly.month >= dt.date(date_from.year, date_from.month, 1),
             FactPnLMonthly.month <= dt.date(date_to.year, date_to.month, 1),
             FactPnLMonthly.scenario == scenario,
         )
-        .group_by(FactPnLMonthly.month, FactPnLMonthly.account_name)
+        .group_by(FactPnLMonthly.month, FactPnLMonthly.account_name, FactPnLMonthly.parent_name)
         .order_by(FactPnLMonthly.month)
-        .all()
     )
-    return [{"month": m.isoformat(), "account": a, "amount": float(val or 0.0)} for m, a, val in rows]
+    rows = _apply_import_run_filter(rows_q, FactPnLMonthly, import_run_id).all()
+    return [
+        {
+            "month": m.isoformat(),
+            "account": a,
+            "parent_name": p,
+            "amount": float(val or 0.0),
+        }
+        for m, a, p, val in rows
+    ]
 
 
 def cashflow(
@@ -480,8 +694,10 @@ def cashflow(
     date_to: dt.date,
     scenario: str = "plan",
     opening_balance: float = 0.0,
+    import_run_id: int | None = None,
 ):
-    rows = (
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
+    rows_q = (
         db.query(FactCashflowMonthly.month, FactCashflowMonthly.account_name, func.sum(FactCashflowMonthly.amount))
         .filter(
             FactCashflowMonthly.project_id == project_id,
@@ -491,8 +707,8 @@ def cashflow(
         )
         .group_by(FactCashflowMonthly.month, FactCashflowMonthly.account_name)
         .order_by(FactCashflowMonthly.month)
-        .all()
     )
+    rows = _apply_import_run_filter(rows_q, FactCashflowMonthly, import_run_id).all()
 
     month_tot = {}
     by_acc = {}

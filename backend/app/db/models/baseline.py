@@ -1,5 +1,5 @@
 import datetime as dt
-from sqlalchemy import ForeignKey, Float, String, UniqueConstraint
+from sqlalchemy import ForeignKey, Float, String, Index
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 from app.db.models._mixins import TimestampMixin
@@ -7,7 +7,25 @@ from app.db.models._mixins import TimestampMixin
 class BaselineVolume(Base, TimestampMixin):
     __tablename__ = "baseline_volume"
     __table_args__ = (
-        UniqueConstraint("project_id", "operation_code", "category", "item_name", name="uq_baseline_row"),
+        Index(
+            "uq_baseline_row_manual",
+            "project_id",
+            "operation_code",
+            "category",
+            "item_name",
+            unique=True,
+            postgresql_where="import_run_id IS NULL",
+        ),
+        Index(
+            "uq_baseline_row_run",
+            "project_id",
+            "import_run_id",
+            "operation_code",
+            "category",
+            "item_name",
+            unique=True,
+            postgresql_where="import_run_id IS NOT NULL",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

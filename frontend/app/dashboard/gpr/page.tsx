@@ -18,6 +18,15 @@ type Operation = {
   plan_qty_total?: number | null;
   plan_start?: string | null;
   plan_finish?: string | null;
+  progress_pct?: number | null;
+  critical?: boolean | null;
+};
+
+type Dependency = {
+  id: number;
+  project_id: number;
+  predecessor_id: number;
+  successor_id: number;
 };
 
 const emptyForm = {
@@ -54,6 +63,8 @@ export default function GprPage() {
     return { projectId: 1, dateFrom: iso(start), dateTo: iso(today) };
   });
   const [ops, setOps] = useState<Operation[]>([]);
+  const [deps, setDeps] = useState<Dependency[]>([]);
+  const [criticalPath, setCriticalPath] = useState<number[]>([]);
   const [q, setQ] = useState("");
   const [includeUndated, setIncludeUndated] = useState(true);
   const [groupBy, setGroupBy] = useState<"wbs" | "discipline" | "block" | "floor" | "ugpr">("discipline");
@@ -61,6 +72,8 @@ export default function GprPage() {
   const [error, setError] = useState<string | null>(null);
   const [form, setForm] = useState({ ...emptyForm });
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [depFrom, setDepFrom] = useState<number | "">("");
+  const [depTo, setDepTo] = useState<number | "">("");
 
   async function load(v: FiltersValue = filters, qValue = q, undated = includeUndated) {
     setLoading(true);
@@ -73,8 +86,10 @@ export default function GprPage() {
         include_undated: String(undated),
       });
       if (qValue.trim()) params.set("q", qValue.trim());
-      const data = await apiFetch(`/gpr/operations?${params.toString()}`);
-      setOps(data || []);
+      const data = await apiFetch(`/gpr/gantt?${params.toString()}`);
+      setOps(data?.operations || []);
+      setDeps(data?.dependencies || []);
+      setCriticalPath(data?.critical_path || []);
     } catch (e: any) {
       setError(e?.message || "Ошибка загрузки операций");
     } finally {
@@ -155,6 +170,38 @@ export default function GprPage() {
     }
   }
 
+  async function addDependency() {
+    if (!depFrom || !depTo) {
+      setError("Выберите предшественника и последователя");
+      return;
+    }
+    try {
+      await apiFetch("/gpr/dependencies", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: filters.projectId,
+          predecessor_id: depFrom,
+          successor_id: depTo,
+        }),
+      });
+      setDepFrom("");
+      setDepTo("");
+      await load(filters);
+    } catch (e: any) {
+      setError(e?.message || "Ошибка добавления зависимости");
+    }
+  }
+
+  async function removeDependency(id: number) {
+    if (!confirm("Удалить зависимость?")) return;
+    try {
+      await apiFetch(`/gpr/dependencies/${id}`, { method: "DELETE" });
+      await load(filters);
+    } catch (e: any) {
+      setError(e?.message || "Ошибка удаления зависимости");
+    }
+  }
+
   const gantt = useMemo(() => {
     const start = toDate(filters.dateFrom);
     const end = toDate(filters.dateTo);
@@ -224,6 +271,19 @@ export default function GprPage() {
       out.push({ left, label });
     }
     return out;
+  }, [filters.dateFrom, filters.dateTo]);
+
+  const todayMarker = useMemo(() => {
+    const start = toDate(filters.dateFrom);
+    const end = toDate(filters.dateTo);
+    if (!start || !end) return null;
+    const today = new Date();
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    if (d < start || d > end) return null;
+    const totalDays = Math.max(1, diffDays(start, end));
+    const offset = diffDays(start, d);
+    const left = (offset / totalDays) * 100;
+    return { left, label: d.toISOString().slice(0, 10), date: d };
   }, [filters.dateFrom, filters.dateTo]);
 
   const grouped = useMemo(() => {
@@ -308,6 +368,14 @@ export default function GprPage() {
               </div>
             </div>
           ))}
+          {todayMarker && (
+            <div className="absolute top-0 bottom-0" style={{ left: `${todayMarker.left}%` }}>
+              <div className="w-px h-full bg-amber-400" />
+              <div className="-translate-x-1/2 text-[10px] text-amber-300 mt-1 whitespace-nowrap">
+                Сегодня
+              </div>
+            </div>
+          )}
         </div>
         <div className="space-y-2">
           {ganttGrouped.slice(0, 20).map(({ label, rows, spanLeft, spanWidth }) => (
@@ -325,6 +393,11 @@ export default function GprPage() {
                 </span>
               </div>
               <div className="relative h-6 bg-neutral-950/60 rounded">
+                {todayMarker && (
+                  <div className="absolute top-0 bottom-0" style={{ left: `${todayMarker.left}%` }}>
+                    <div className="w-px h-full bg-amber-400/60" />
+                  </div>
+                )}
                 <div
                   className="absolute top-1 bottom-1 rounded bg-emerald-600/70"
                   style={{ left: `${spanLeft}%`, width: `${spanWidth}%` }}
@@ -334,11 +407,43 @@ export default function GprPage() {
               {!ganttCollapsed[label] &&
                 rows.slice(0, 20).map(({ op, left, width }) => (
                   <div key={op.id} className="relative h-7 bg-neutral-950/60 rounded">
+                    {todayMarker && (
+                      <div className="absolute top-0 bottom-0" style={{ left: `${todayMarker.left}%` }}>
+                        <div className="w-px h-full bg-amber-400/50" />
+                      </div>
+                    )}
                     <div
-                      className="absolute top-1 bottom-1 rounded bg-sky-600"
+                      className="absolute top-1 bottom-1 rounded bg-neutral-800"
+                      style={{ left: `${left}%`, width: `${width}%` }}
+                    />
+                    <div
+                      className={`absolute top-1 bottom-1 rounded ${
+                        op.critical ? "bg-red-500" : "bg-sky-600"
+                      }`}
                       style={{ left: `${left}%`, width: `${width}%` }}
                       title={`${op.code} • ${op.name}`}
                     />
+                    {typeof op.progress_pct === "number" && (
+                      <div
+                        className="absolute top-1 bottom-1 rounded bg-emerald-400/80"
+                        style={{
+                          left: `${left}%`,
+                          width: `${(width * Math.max(0, Math.min(100, op.progress_pct))) / 100}%`,
+                        }}
+                        title={`Прогресс: ${op.progress_pct.toFixed(1)}%`}
+                      />
+                    )}
+                    {todayMarker &&
+                      op.plan_start &&
+                      op.plan_finish &&
+                      todayMarker.date >= toDate(op.plan_start)! &&
+                      todayMarker.date <= toDate(op.plan_finish)! && (
+                        <div
+                          className="absolute -inset-[1px] rounded border border-amber-400/80"
+                          style={{ left: `${left}%`, width: `${width}%` }}
+                          title="Текущая операция"
+                        />
+                      )}
                     <div className="absolute left-2 top-1 text-xs text-neutral-200 truncate">
                       {op.code} — {op.name}
                     </div>
@@ -364,6 +469,7 @@ export default function GprPage() {
               <th className="text-left px-3 py-2">Старт</th>
               <th className="text-left px-3 py-2">Финиш</th>
               <th className="text-right px-3 py-2">План</th>
+              <th className="text-right px-3 py-2">Прогресс</th>
               <th className="text-right px-3 py-2">Действия</th>
             </tr>
           </thead>
@@ -371,7 +477,7 @@ export default function GprPage() {
             {grouped.slice(0, 20).map(([label, items]) => (
               <>
                 <tr key={`group-${label}`} className="bg-neutral-950/60 text-neutral-300">
-                  <td className="px-3 py-2" colSpan={9}>
+                  <td className="px-3 py-2" colSpan={10}>
                     {label} <span className="text-neutral-500">({items.length})</span>
                   </td>
                 </tr>
@@ -386,6 +492,9 @@ export default function GprPage() {
                     <td className="px-3 py-2">{op.plan_finish || "—"}</td>
                     <td className="px-3 py-2 text-right">
                       {typeof op.plan_qty_total === "number" ? op.plan_qty_total.toFixed(2) : "—"}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      {typeof op.progress_pct === "number" ? `${op.progress_pct.toFixed(1)}%` : "—"}
                     </td>
                     <td className="px-3 py-2 text-right space-x-2">
                       <button
@@ -407,13 +516,97 @@ export default function GprPage() {
             ))}
             {ops.length === 0 && !loading && (
               <tr>
-                <td className="px-3 py-3 text-neutral-500" colSpan={9}>
+                <td className="px-3 py-3 text-neutral-500" colSpan={10}>
                   Нет операций для выбранного проекта.
                 </td>
               </tr>
             )}
           </tbody>
         </table>
+      </div>
+
+      <div className="mt-4 rounded-xl bg-neutral-900 border border-neutral-800 p-4">
+        <div className="text-sm text-neutral-300 mb-3">Зависимости (FS)</div>
+        <div className="flex flex-wrap gap-3 items-end text-sm">
+          <label>
+            <div className="text-neutral-400 mb-1">Предшественник</div>
+            <select
+              className="px-3 py-2 rounded bg-neutral-900 border border-neutral-800"
+              value={depFrom}
+              onChange={(e) => setDepFrom(e.target.value ? Number(e.target.value) : "")}
+            >
+              <option value="">—</option>
+              {ops.map((o) => (
+                <option key={`from-${o.id}`} value={o.id}>
+                  {o.code} · {o.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <div className="text-neutral-400 mb-1">Последователь</div>
+            <select
+              className="px-3 py-2 rounded bg-neutral-900 border border-neutral-800"
+              value={depTo}
+              onChange={(e) => setDepTo(e.target.value ? Number(e.target.value) : "")}
+            >
+              <option value="">—</option>
+              {ops.map((o) => (
+                <option key={`to-${o.id}`} value={o.id}>
+                  {o.code} · {o.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button className="px-4 py-2 rounded bg-sky-600 hover:bg-sky-500 text-sm" onClick={addDependency}>
+            Добавить связь
+          </button>
+        </div>
+        <div className="mt-3 rounded border border-neutral-800 overflow-hidden">
+          <table className="w-full text-xs">
+            <thead className="bg-neutral-950/60 text-neutral-300">
+              <tr>
+                <th className="text-left px-2 py-2">Предшественник</th>
+                <th className="text-left px-2 py-2">Последователь</th>
+                <th className="text-right px-2 py-2">Действия</th>
+              </tr>
+            </thead>
+            <tbody>
+              {deps.map((d) => {
+                const from = ops.find((o) => o.id === d.predecessor_id);
+                const to = ops.find((o) => o.id === d.successor_id);
+                return (
+                  <tr key={`dep-${d.id}`} className="border-t border-neutral-800">
+                    <td className="px-2 py-1">
+                      {from ? `${from.code} · ${from.name}` : d.predecessor_id}
+                    </td>
+                    <td className="px-2 py-1">{to ? `${to.code} · ${to.name}` : d.successor_id}</td>
+                    <td className="px-2 py-1 text-right">
+                      <button className="text-red-400 hover:underline" onClick={() => removeDependency(d.id)}>
+                        Удалить
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+              {deps.length === 0 && (
+                <tr>
+                  <td className="px-2 py-2 text-neutral-500" colSpan={3}>
+                    Зависимостей нет.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        {criticalPath.length > 0 && (
+          <div className="mt-2 text-xs text-neutral-400">
+            Критический путь:{" "}
+            {criticalPath
+              .map((id) => ops.find((o) => o.id === id)?.code || String(id))
+              .join(" → ")}
+          </div>
+        )}
       </div>
 
       <div className="mt-4 rounded-xl bg-neutral-900 border border-neutral-800 p-4">

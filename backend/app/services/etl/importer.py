@@ -168,8 +168,8 @@ def _file_path(run: ImportRun) -> Path:
     return Path(settings.UPLOAD_DIR) / f"{run.project_id}_{run.file_hash}.xlsx"
 
 
-def _cleanup_imported(db: Session, project_id: int) -> None:
-    # remove previously imported rows, keep manual rows (import_run_id is NULL)
+def _cleanup_imported(db: Session, project_id: int, import_run_id: int) -> None:
+    # remove previously imported rows for this run, keep other versions and manual rows
     for model in (
         FactVolumeDaily,
         FactResourceDaily,
@@ -179,7 +179,8 @@ def _cleanup_imported(db: Session, project_id: int) -> None:
         BaselineVolume,
     ):
         db.query(model).filter(
-            model.project_id == project_id, model.import_run_id.isnot(None)
+            model.project_id == project_id,
+            model.import_run_id == import_run_id,
         ).delete(synchronize_session=False)
     db.commit()
 
@@ -391,7 +392,14 @@ def _load_baseline(db: Session, project_id: int, import_run_id: int, baseline_df
                 amount_total=_to_float_nullable(r.get("amount_total")),
             )
             .on_conflict_do_update(
-                constraint="uq_baseline_row",
+                index_elements=[
+                    BaselineVolume.project_id,
+                    BaselineVolume.import_run_id,
+                    BaselineVolume.operation_code,
+                    BaselineVolume.category,
+                    BaselineVolume.item_name,
+                ],
+                index_where=BaselineVolume.import_run_id.isnot(None),
                 set_=dict(
                     plan_qty_total=_to_float_nullable(r.get("plan_qty_total")),
                     price=_to_float_nullable(r.get("price")),
@@ -431,7 +439,15 @@ def _load_fact_volume(db: Session, project_id: int, import_run_id: int, fact_df)
                 amount=_to_float_nullable(r.get("amount")),
             )
             .on_conflict_do_update(
-                constraint="uq_fact_volume_day",
+                index_elements=[
+                    FactVolumeDaily.project_id,
+                    FactVolumeDaily.import_run_id,
+                    FactVolumeDaily.operation_code,
+                    FactVolumeDaily.category,
+                    FactVolumeDaily.item_name,
+                    FactVolumeDaily.date,
+                ],
+                index_where=FactVolumeDaily.import_run_id.isnot(None),
                 set_=dict(
                     qty=_to_float(r.get("qty"), 0.0),
                     amount=_to_float_nullable(r.get("amount")),
@@ -557,7 +573,15 @@ def _load_manhours(db: Session, project_id: int, import_run_id: int, people_df) 
             insert(FactResourceDaily)
             .values(**values)
             .on_conflict_do_update(
-                constraint="uq_res_day",
+                index_elements=[
+                    FactResourceDaily.project_id,
+                    FactResourceDaily.import_run_id,
+                    FactResourceDaily.resource_name,
+                    FactResourceDaily.category,
+                    FactResourceDaily.date,
+                    FactResourceDaily.scenario,
+                ],
+                index_where=FactResourceDaily.import_run_id.isnot(None),
                 set_=dict(
                     qty=values.get("qty"),
                     manhours=values.get("manhours"),
@@ -757,7 +781,7 @@ def run_import(db: Session, run: ImportRun) -> tuple[list[ValidationError], int]
     logger.info("import_start", import_run_id=run.id, path=str(path))
 
     # Cleanup old imported snapshot for this project
-    _cleanup_imported(db, run.project_id)
+    _cleanup_imported(db, run.project_id, run.id)
 
     baseline_df, fact_df, e1 = parse_vdc(str(path))
     gpr_df, e2 = parse_gpr(str(path))

@@ -12,6 +12,8 @@ const navItems = [
   { href: "/dashboard/pnl", label: "БДР", icon: "M4 17l5-5 4 4 7-7" },
   { href: "/dashboard/cashflow", label: "БДДС", icon: "M5 12h14M7 8h10M9 16h6" },
   { href: "/dashboard/manhours", label: "Manhours", icon: "M8 6h8M4 18h16M6 10h12" },
+  { href: "/dashboard/projects", label: "Проекты", icon: "M3 7h18M5 7v14M19 7v14M3 11h18" },
+  { href: "/dashboard/users", label: "Пользователи", icon: "M16 11a4 4 0 10-8 0M4 20a6 6 0 0116 0" },
   { href: "/dashboard/import", label: "Импорт", icon: "M12 4v10M8 10l4 4 4-4M4 18h16" },
 ];
 

@@ -74,29 +74,118 @@ def _parse_month_columns(ws, year_row: int, month_row: int) -> list[dict]:
             month_cols.append({"col": c, "month": month_start(y, RU_MONTHS[mv]), "scenario": scen})
     return month_cols
 
+
+def _find_month_row(ws, start_row: int, max_rows: int = 8) -> int | None:
+    for r in range(start_row, start_row + max_rows):
+        for c in range(1, ws.max_column + 1):
+            mv = _upper(ws.cell(r, c).value)
+            if mv in MONTH_NAMES:
+                return r
+    return None
+
+
+def _collect_year_by_col(ws, start_row: int, end_row: int) -> dict[int, int]:
+    year_by_col: dict[int, int] = {}
+    for r in range(start_row, end_row + 1):
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if isinstance(v, int):
+                year_by_col[c] = v
+            elif isinstance(v, float) and v.is_integer():
+                year_by_col[c] = int(v)
+            elif isinstance(v, str):
+                m = re.search(r"(20\d{2})", v)
+                if m:
+                    year_by_col[c] = int(m.group(1))
+    # forward-fill
+    last_year = None
+    for c in range(1, ws.max_column + 1):
+        if c in year_by_col:
+            last_year = year_by_col[c]
+        elif last_year:
+            year_by_col[c] = last_year
+    return year_by_col
+
+
+def _collect_scenario_by_col(ws, start_row: int, end_row: int) -> dict[int, str]:
+    scen_by_col: dict[int, str] = {}
+    for r in range(start_row, end_row + 1):
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if not isinstance(v, str):
+                continue
+            s = v.strip().lower()
+            if "прогноз" in s:
+                scen_by_col[c] = "forecast"
+            elif "факт" in s:
+                scen_by_col[c] = "fact"
+            elif "план" in s:
+                scen_by_col[c] = "plan"
+    return scen_by_col
+
 def parse_bdr(path: str) -> tuple[pd.DataFrame, list[ValidationError]]:
     errors=[]
     wb=openpyxl.load_workbook(path, data_only=True, read_only=True)
     if "БДР" not in wb.sheetnames:
         return pd.DataFrame(), [ValidationError("Не найден лист 'БДР'", sheet="БДР")]
     ws=wb["БДР"]
-    header_year=_find_header_row(ws, "Статья БДР")  # row containing keyword
-    if not header_year:
+    header_row=_find_header_row(ws, "Статья БДР")  # row containing keyword
+    if not header_row:
         return pd.DataFrame(), [ValidationError("Не найдена строка заголовка 'Статья БДР'", sheet="БДР")]
-    header_month=header_year+1
-    month_cols=_parse_month_columns(ws, header_year, header_month)
+    month_row = _find_month_row(ws, header_row, max_rows=6)
+    if not month_row:
+        return pd.DataFrame(), [ValidationError("Не найдены месячные колонки в БДР", sheet="БДР")]
+
+    year_by_col = _collect_year_by_col(ws, header_row, month_row)
+    scen_by_col = _collect_scenario_by_col(ws, header_row, month_row)
+
+    month_cols=[]
+    for c in range(1, ws.max_column + 1):
+        mv=_upper(ws.cell(month_row, c).value)
+        if mv in MONTH_NAMES:
+            y=year_by_col.get(c)
+            if not y:
+                raw = ws.cell(month_row, c).value
+                if isinstance(raw, str):
+                    m = re.search(r"(20\d{2})", raw)
+                    if m:
+                        y = int(m.group(1))
+            if not y:
+                continue
+            scenario = scen_by_col.get(c, "plan")
+            if scenario == "forecast":
+                continue
+            month_cols.append({"col": c, "month": month_start(y, RU_MONTHS[mv]), "scenario": scenario})
     if not month_cols:
         return pd.DataFrame(), [ValidationError("Не найдены месячные колонки в БДР", sheet="БДР")]
 
+    # detect name column
+    name_col = 1
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(header_row, c).value
+        if isinstance(v, str) and "статья" in v.lower() and "бдр" in v.lower():
+            name_col = c
+            break
+
     data=[]
-    start_row=header_month+1
+    start_row=month_row+1
+    current_parent: str | None = None
     for r in range(start_row, ws.max_row+1):
-        name=ws.cell(r,2).value  # usually column B
+        raw = ws.cell(r, name_col).value
+        name = raw
         if name is None:
             continue
         if isinstance(name,str) and name.strip()=="":
             continue
-        account=str(name).strip()
+        account = str(name).strip()
+        indent = 0
+        if isinstance(raw, str):
+            indent = len(raw) - len(raw.lstrip())
+        parent_name = None
+        if indent == 0:
+            current_parent = account
+        else:
+            parent_name = current_parent
         for mc in month_cols:
             v=ws.cell(r, mc["col"]).value
             if v is None:
@@ -109,7 +198,7 @@ def parse_bdr(path: str) -> tuple[pd.DataFrame, list[ValidationError]]:
                 continue
             data.append({
                 "account_name": account,
-                "parent_name": None,
+                "parent_name": parent_name,
                 "month": mc["month"],
                 "scenario": mc["scenario"],
                 "amount": val,

@@ -1,19 +1,21 @@
-# Excel2Web ERP (MVP)
+# Excel2Web ERP
 
-Цель: заменить тяжёлый Excel-файл веб‑системой **PostgreSQL + FastAPI + Celery + Next.js**, сохранив логику:
-- ВДЦ (факт объёмов по дням)
-- ГПР (планы по операциям и распределение по месяцам)
-- Люди/Техника (manhours / машино‑часы)
-- БДР (P&L)
-- БДДС (Cash Flow)
-- Дашборды: План/Факт, Прогресс, БДР, БДДС, Manhours
-- Импорт Excel (идемпотентный), ручной ввод
+Фаза 1: замена тяжёлой Excel‑модели веб‑системой **PostgreSQL + FastAPI + Celery + Next.js** с базовой аналитикой и управляемым импортом.
+
+## Возможности
+
+- Импорт Excel (ВДЦ, ГПР, Люди/Техника, БДР, БДДС)
+- Версионные импорты и сравнение версий
+- План/Факт и KPI, прогресс по группам
+- БДР/БДДС и Manhours
+- ГПР с диаграммой Ганта, зависимостями и критическим путём
+- Ручной ввод факта и финансовых записей
+- Роли пользователей и JWT‑аутентификация
 
 ## Быстрый старт (Docker)
 
 ```bash
-cd infra
-docker compose up --build
+docker compose -f infra/docker-compose.yml up --build
 ```
 
 - Frontend: http://localhost:3000
@@ -22,11 +24,32 @@ docker compose up --build
 Dev‑логин (если `SEED_DEMO=true`):
 - `admin / admin123`
 
-## Импорт
+## Миграции
+
+Если база уже создана без alembic:
+
+```bash
+docker compose -f infra/docker-compose.yml run --rm -w /app backend \
+  env PYTHONPATH=/app alembic stamp 0001_init
+
+docker compose -f infra/docker-compose.yml run --rm -w /app backend \
+  env PYTHONPATH=/app alembic upgrade head
+```
+
+Если база новая:
+
+```bash
+docker compose -f infra/docker-compose.yml run --rm -w /app backend \
+  env PYTHONPATH=/app alembic upgrade head
+```
+
+## Импорт Excel
 
 1) В UI: Dashboard → **Импорт** → выбери Project ID → загрузи `.xlsx`  
 2) Статус импорта появится в таблице.  
-3) Импорт идемпотентный по hash файла: тот же файл не загрузится повторно.
+3) Каждый импорт хранится как версия (можно сравнивать).
+
+Формат Excel описан в `docs/IMPORT_FORMAT.md`.
 
 ## Архитектура (кратко)
 
@@ -35,10 +58,10 @@ Dev‑логин (если `SEED_DEMO=true`):
 - `frontend/app/dashboard/*` — страницы дашбордов
 - `infra/docker-compose.yml` — Postgres + Redis + backend + worker + frontend
 
-## Следующий шаг
+## Документация
 
-- Гант по ГПР (операции)  
-- Точный план по WBS/дисциплине (не «пропорционально факту»)  
-- Поллинг/WS статуса импорта  
-- Экспорт отчётов в PDF/XLSX по шаблонам заказчика
-# excel2web_repo
+- `docs/ARCHITECTURE.md` — архитектура и слои
+- `docs/SETUP.md` — локальный запуск и миграции
+- `docs/IMPORT_FORMAT.md` — формат Excel для импорта
+- `docs/VERSIONS.md` — версии импорта и сравнение
+- `docs/ROADMAP.md` — фазы развития проекта

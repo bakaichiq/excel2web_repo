@@ -41,3 +41,27 @@ class OperationOut(BaseModel):
     plan_qty_total: float | None = None
     plan_start: dt.date | None = None
     plan_finish: dt.date | None = None
+
+
+class OperationGanttOut(OperationOut):
+    progress_pct: float | None = None
+    critical: bool = False
+
+
+class DependencyCreate(BaseModel):
+    project_id: int
+    predecessor_id: int
+    successor_id: int
+
+
+class DependencyOut(BaseModel):
+    id: int
+    project_id: int
+    predecessor_id: int
+    successor_id: int
+
+
+class GanttOut(BaseModel):
+    operations: list[OperationGanttOut]
+    dependencies: list[DependencyOut]
+    critical_path: list[int]

@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pathlib import Path
 import uuid
+import datetime as dt
 
 from app.core.deps import get_db, require_roles
 from app.db.models.user import Role
@@ -18,6 +19,7 @@ from app.db.models.facts import (
 )
 from app.schemas.imports import ImportRunOut, ImportErrorOut
 from app.services.etl.utils import file_sha256
+from app.services.reports.service import kpi as kpi_calc, plan_fact_table_by as pft_calc
 from app.services.files import ensure_dirs, save_upload
 from app.crud.imports import get_or_create_import_run, list_imports, list_import_errors
 from app.worker.tasks import run_import_task
@@ -124,3 +126,99 @@ def upload_excel(
     # enqueue celery task
     run_import_task.delay(run.id)
     return run
+
+
+@router.get("/compare")
+def compare_imports(
+    project_id: int = Query(...),
+    run_a: int = Query(...),
+    run_b: int = Query(...),
+    date_from: str = Query(...),
+    date_to: str = Query(...),
+    by: str = Query("wbs", pattern="^(wbs|discipline|block|floor|ugpr)$"),
+    scenario: str = Query("plan", pattern="^(plan|forecast|actual)$"),
+    wbs_path: str | None = Query(None),
+    db: Session = Depends(get_db),
+    _user=Depends(require_roles(*ALLOWED_ROLES_VIEW)),
+):
+    _ensure_project_exists(db, project_id)
+    if run_a == run_b:
+        raise HTTPException(status_code=400, detail="run_a and run_b must be different")
+
+    dt_from = dt.datetime.strptime(date_from, "%Y-%m-%d").date()
+    dt_to = dt.datetime.strptime(date_to, "%Y-%m-%d").date()
+
+    def _check_run(run_id: int):
+        run = db.query(ImportRun).filter(ImportRun.id == run_id, ImportRun.project_id == project_id).one_or_none()
+        if not run:
+            raise HTTPException(status_code=404, detail=f"Import run {run_id} not found")
+        return run
+
+    _check_run(run_a)
+    _check_run(run_b)
+
+    kpi_a = kpi_calc(db, project_id, dt_from, dt_to, wbs_path=wbs_path, import_run_id=run_a)
+    kpi_b = kpi_calc(db, project_id, dt_from, dt_to, wbs_path=wbs_path, import_run_id=run_b)
+
+    table_a = pft_calc(
+        db,
+        project_id,
+        dt_from,
+        dt_to,
+        by=by,
+        scenario=scenario,
+        wbs_path=wbs_path,
+        import_run_id=run_a,
+    )
+    table_b = pft_calc(
+        db,
+        project_id,
+        dt_from,
+        dt_to,
+        by=by,
+        scenario=scenario,
+        wbs_path=wbs_path,
+        import_run_id=run_b,
+    )
+
+    map_a = {r["key"]: r for r in table_a.get("rows", [])}
+    map_b = {r["key"]: r for r in table_b.get("rows", [])}
+    keys = sorted(set(map_a.keys()) | set(map_b.keys()))
+    rows = []
+    for key in keys:
+        a = map_a.get(key, {"fact": 0.0, "plan": 0.0, "variance": 0.0, "progress_pct": 0.0})
+        b = map_b.get(key, {"fact": 0.0, "plan": 0.0, "variance": 0.0, "progress_pct": 0.0})
+        rows.append(
+            {
+                "key": key,
+                "a": a,
+                "b": b,
+                "delta": {
+                    "fact": float(b["fact"]) - float(a["fact"]),
+                    "plan": float(b["plan"]) - float(a["plan"]),
+                    "variance": float(b["variance"]) - float(a["variance"]),
+                    "progress_pct": float(b["progress_pct"]) - float(a["progress_pct"]),
+                },
+            }
+        )
+
+    return {
+        "project_id": project_id,
+        "run_a": run_a,
+        "run_b": run_b,
+        "period": {"date_from": dt_from.isoformat(), "date_to": dt_to.isoformat()},
+        "kpi": {
+            "a": kpi_a,
+            "b": kpi_b,
+            "delta": {
+                "fact_qty": kpi_b["fact_qty"] - kpi_a["fact_qty"],
+                "plan_qty": kpi_b["plan_qty"] - kpi_a["plan_qty"],
+                "progress_pct": kpi_b["progress_pct"] - kpi_a["progress_pct"],
+                "manhours": kpi_b["manhours"] - kpi_a["manhours"],
+                "productivity": (
+                    (kpi_b["productivity"] or 0.0) - (kpi_a["productivity"] or 0.0)
+                ),
+            },
+        },
+        "table": {"by": by, "scenario": scenario, "rows": rows},
+    }
