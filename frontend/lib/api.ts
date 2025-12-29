@@ -82,3 +82,7 @@ export async function login(loginValue: string, password: string) {
   setToken(token);
   return data;
 }
+
+export async function getProjectPlanRange(projectId: number) {
+  return apiFetch(`/projects/${projectId}/plan-range`);
+}

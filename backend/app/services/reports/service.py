@@ -289,19 +289,25 @@ def plan_fact_series(
         # Use non-zero fact points for regression
         xs = []
         ys = []
+        last_fact_idx = None
         for i, p in enumerate(periods):
             v = fact_map.get(p, 0.0)
             if v > 0:
                 xs.append(float(i))
                 ys.append(float(v))
+                last_fact_idx = i
 
         if not xs:
+            return []
+
+        # Forecast only after last fact period
+        if last_fact_idx is None or last_fact_idx >= len(periods) - 1:
             return []
 
         if len(xs) == 1:
             # flat forecast from last known fact
             last_val = ys[0]
-            return [(p, last_val) for p in periods]
+            return [(p, last_val) for p in periods[last_fact_idx + 1 :]]
 
         # simple linear regression y = a*x + b
         n = float(len(xs))
@@ -312,13 +318,13 @@ def plan_fact_series(
         denom = (n * sum_xx - sum_x * sum_x)
         if denom == 0:
             last_val = ys[-1]
-            return [(p, last_val) for p in periods]
+            return [(p, last_val) for p in periods[last_fact_idx + 1 :]]
 
         a = (n * sum_xy - sum_x * sum_y) / denom
         b = (sum_y - a * sum_x) / n
 
         forecast = []
-        for i, p in enumerate(periods):
+        for i, p in enumerate(periods[last_fact_idx + 1 :], start=last_fact_idx + 1):
             v = a * float(i) + b
             forecast.append((p, float(v)))
         return forecast
@@ -648,6 +654,213 @@ def ugpr_series(
             plan_out.append({"period": p.isoformat(), "value": float(out_map[p] or 0.0)})
 
     return {"series": out, "plan": plan_out}
+
+
+def manhours_series(
+    db: Session,
+    project_id: int,
+    date_from: dt.date,
+    date_to: dt.date,
+    granularity: Granularity = "month",
+    import_run_id: int | None = None,
+):
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
+    if granularity == "day":
+        period_expr = FactResourceDaily.date
+    elif granularity == "week":
+        period_expr = cast(func.date_trunc("week", FactResourceDaily.date), Date)
+    else:
+        period_expr = cast(func.date_trunc("month", FactResourceDaily.date), Date)
+
+    value_expr = func.coalesce(FactResourceDaily.manhours, FactResourceDaily.qty)
+
+    def _rows_for_scenario(scenario: str):
+        qry = (
+            db.query(period_expr.label("period"), func.coalesce(func.sum(value_expr), 0.0).label("value"))
+            .filter(
+                FactResourceDaily.project_id == project_id,
+                FactResourceDaily.date >= date_from,
+                FactResourceDaily.date <= date_to,
+                FactResourceDaily.scenario == scenario,
+            )
+        )
+        qry = _apply_import_run_filter(qry, FactResourceDaily, import_run_id)
+        return qry.group_by(period_expr).order_by(period_expr).all()
+
+    plan_rows = _rows_for_scenario("plan")
+    fact_rows = _rows_for_scenario("fact")
+
+    def to_points(rows):
+        out = []
+        for p, v in rows:
+            period = p.isoformat() if hasattr(p, "isoformat") else str(p)
+            out.append({"period": period, "value": float(v or 0.0)})
+        return out
+
+    return {"plan": to_points(plan_rows), "fact": to_points(fact_rows)}
+
+
+def ugpr_operation_table(
+    db: Session,
+    project_id: int,
+    date_from: dt.date,
+    date_to: dt.date,
+    wbs_path: str | None = None,
+    import_run_id: int | None = None,
+):
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
+    today = dt.date.today()
+    month_start = dt.date(today.year, today.month, 1)
+    month_end = month_start + dt.timedelta(days=_month_days(month_start) - 1)
+    week_start = today - dt.timedelta(days=today.weekday())
+    week_end = week_start + dt.timedelta(days=6)
+
+    def _overlap_days(a_start: dt.date, a_end: dt.date, b_start: dt.date, b_end: dt.date) -> int:
+        start = max(a_start, b_start)
+        end = min(a_end, b_end)
+        if start > end:
+            return 0
+        return (end - start).days + 1
+
+    price_q = (
+        db.query(
+            BaselineVolume.operation_code,
+            BaselineVolume.price,
+            BaselineVolume.plan_qty_total,
+            BaselineVolume.amount_total,
+        )
+        .filter(BaselineVolume.project_id == project_id)
+    )
+    price_q = _apply_import_run_filter(price_q, BaselineVolume, import_run_id)
+    price_rows = price_q.all()
+    price_map: dict[str, list[float]] = {}
+    for code, price, qty_total, amount_total in price_rows:
+        if not code:
+            continue
+        unit_price = None
+        if price is not None:
+            unit_price = float(price)
+        elif qty_total and amount_total is not None:
+            try:
+                unit_price = float(amount_total) / float(qty_total)
+            except Exception:
+                unit_price = None
+        if unit_price is None:
+            continue
+        price_map.setdefault(code, []).append(unit_price)
+    price_by_op = {k: sum(v) / len(v) for k, v in price_map.items()}
+
+    ops_q = db.query(Operation.code, Operation.name).filter(Operation.project_id == project_id)
+    if wbs_path:
+        ops_q = (
+            ops_q.join(WBS, Operation.wbs_id == WBS.id)
+            .filter(WBS.path.ilike(f"{wbs_path}%"))
+        )
+    ops = ops_q.all()
+    op_name = {code: (name or code) for code, name in ops}
+
+    plan_q = (
+        db.query(PlanVolumeMonthly.operation_code, PlanVolumeMonthly.month, PlanVolumeMonthly.qty)
+        .filter(
+            PlanVolumeMonthly.project_id == project_id,
+            PlanVolumeMonthly.scenario == "plan",
+        )
+    )
+    plan_q = _apply_import_run_filter(plan_q, PlanVolumeMonthly, import_run_id)
+    if wbs_path:
+        plan_q = (
+            plan_q.join(Operation, Operation.code == PlanVolumeMonthly.operation_code)
+            .join(WBS, Operation.wbs_id == WBS.id)
+            .filter(WBS.path.ilike(f"{wbs_path}%"))
+        )
+    plan_rows = plan_q.all()
+
+    plan = {}
+    for code, month, qty in plan_rows:
+        price = price_by_op.get(code, 0.0)
+        amount = float(qty or 0.0) * price
+        m_start = month
+        m_end = month + dt.timedelta(days=_month_days(month) - 1)
+        plan.setdefault(code, {
+            "lcp": 0.0,
+            "period": 0.0,
+            "month": 0.0,
+            "week": 0.0,
+            "day": 0.0,
+        })
+        plan[code]["lcp"] += amount
+
+        period_days = _overlap_days(m_start, m_end, date_from, date_to)
+        if period_days:
+            plan[code]["period"] += (amount / _month_days(month)) * period_days
+
+        if m_start == month_start:
+            plan[code]["month"] += amount
+
+        week_days = _overlap_days(m_start, m_end, week_start, week_end)
+        if week_days:
+            plan[code]["week"] += (amount / _month_days(month)) * week_days
+
+        if today >= m_start and today <= m_end:
+            plan[code]["day"] += amount / _month_days(month)
+
+    fact_q = (
+        db.query(
+            FactVolumeDaily.operation_code,
+            FactVolumeDaily.date,
+            FactVolumeDaily.qty,
+            FactVolumeDaily.amount,
+        )
+        .filter(FactVolumeDaily.project_id == project_id)
+    )
+    fact_q = _apply_import_run_filter(fact_q, FactVolumeDaily, import_run_id)
+    if wbs_path:
+        fact_q = fact_q.filter(FactVolumeDaily.wbs.ilike(f"{wbs_path}%"))
+    fact_rows = fact_q.all()
+
+    fact = {}
+    for code, d, qty, amount in fact_rows:
+        price = price_by_op.get(code, 0.0)
+        amt = float(amount) if amount is not None else float(qty or 0.0) * price
+        fact.setdefault(code, {
+            "lcp": 0.0,
+            "period": 0.0,
+            "month": 0.0,
+            "week": 0.0,
+            "day": 0.0,
+        })
+        fact[code]["lcp"] += amt
+        if date_from <= d <= date_to:
+            fact[code]["period"] += amt
+        if month_start <= d <= month_end:
+            fact[code]["month"] += amt
+        if week_start <= d <= week_end:
+            fact[code]["week"] += amt
+        if d == today:
+            fact[code]["day"] += amt
+
+    codes = sorted(set(op_name.keys()) | set(plan.keys()) | set(fact.keys()))
+    rows = []
+    for code in codes:
+        p = plan.get(code, {})
+        f = fact.get(code, {})
+        rows.append({
+            "operation_code": code,
+            "operation_name": op_name.get(code, code),
+            "plan_lcp": float(p.get("lcp", 0.0)),
+            "fact_lcp": float(f.get("lcp", 0.0)),
+            "plan_period": float(p.get("period", 0.0)),
+            "fact_period": float(f.get("period", 0.0)),
+            "plan_month": float(p.get("month", 0.0)),
+            "fact_month": float(f.get("month", 0.0)),
+            "plan_week": float(p.get("week", 0.0)),
+            "fact_week": float(f.get("week", 0.0)),
+            "plan_day": float(p.get("day", 0.0)),
+            "fact_day": float(f.get("day", 0.0)),
+        })
+
+    rows.sort(key=lambda r: abs(r["fact_period"]), reverse=True)
+    return {"rows": rows}
 
 
 def pnl(

@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Shell from "../../../components/Shell";
 import Filters, { FiltersValue } from "../../../components/Filters";
-import { apiFetch } from "../../../lib/api";
+import { apiFetch, getProjectPlanRange } from "../../../lib/api";
 
 type Operation = {
   id: number;
@@ -57,10 +57,7 @@ function diffDays(a: Date, b: Date) {
 
 export default function GprPage() {
   const [filters, setFilters] = useState<FiltersValue>(() => {
-    const today = new Date();
-    const start = new Date(today.getFullYear(), today.getMonth(), 1);
-    const iso = (d: Date) => d.toISOString().slice(0, 10);
-    return { projectId: 1, dateFrom: iso(start), dateTo: iso(today) };
+    return { projectId: 1, dateFrom: "", dateTo: "" };
   });
   const [ops, setOps] = useState<Operation[]>([]);
   const [deps, setDeps] = useState<Dependency[]>([]);
@@ -98,7 +95,38 @@ export default function GprPage() {
   }
 
   useEffect(() => {
-    load(filters);
+    let ignore = false;
+    async function init() {
+      const today = new Date();
+      const start = new Date(today.getFullYear(), today.getMonth(), 1);
+      const iso = (d: Date) => d.toISOString().slice(0, 10);
+      try {
+        const r = await getProjectPlanRange(filters.projectId);
+        const planStart = r?.plan_start ? String(r.plan_start).slice(0, 10) : null;
+        const planFinish = r?.plan_finish ? String(r.plan_finish).slice(0, 10) : null;
+        if ((planStart || planFinish) && !ignore) {
+          const v = {
+            ...filters,
+            dateFrom: planStart || iso(start),
+            dateTo: planFinish || iso(today),
+          };
+          setFilters(v);
+          await load(v);
+          return;
+        }
+      } catch {
+        // ignore
+      }
+      if (!ignore) {
+        const v = { ...filters, dateFrom: iso(start), dateTo: iso(today) };
+        setFilters(v);
+        await load(v);
+      }
+    }
+    init();
+    return () => {
+      ignore = true;
+    };
   }, []);
 
   function startEdit(op: Operation) {
@@ -255,6 +283,20 @@ export default function GprPage() {
     setGanttCollapsed((prev) => ({ ...prev, [label]: !prev[label] }));
   }
 
+  const ganttRows = useMemo(() => {
+    const out: Array<
+      | { type: "group"; label: string; spanLeft: number; spanWidth: number; rows: { op: Operation; left: number; width: number }[] }
+      | { type: "item"; op: Operation; left: number; width: number }
+    > = [];
+    ganttGrouped.forEach((g) => {
+      out.push({ type: "group", label: g.label, spanLeft: g.spanLeft, spanWidth: g.spanWidth, rows: g.rows });
+      if (!ganttCollapsed[g.label]) {
+        g.rows.forEach((r) => out.push({ type: "item", op: r.op, left: r.left, width: r.width }));
+      }
+    });
+    return out;
+  }, [ganttGrouped, ganttCollapsed]);
+
   const ganttTicks = useMemo(() => {
     const start = toDate(filters.dateFrom);
     const end = toDate(filters.dateTo);
@@ -359,54 +401,72 @@ export default function GprPage() {
 
       <div className="mt-4 rounded-xl bg-neutral-900 border border-neutral-800 p-3">
         <div className="text-sm text-neutral-300 mb-2">Диаграмма Ганта</div>
-        <div className="relative h-8 mb-3 bg-neutral-950/60 rounded">
-          {ganttTicks.map((t) => (
-            <div key={t.label} className="absolute top-1 bottom-1" style={{ left: `${t.left}%` }}>
-              <div className="w-px h-full bg-neutral-700" />
-              <div className="-translate-x-1/2 text-[10px] text-neutral-400 mt-1 whitespace-nowrap">
-                {t.label}
-              </div>
+        <div className="grid grid-cols-[380px_1fr] gap-3">
+          <div className="text-xs text-neutral-400">
+            <div className="grid grid-cols-[1fr_96px_96px] gap-2 px-2 py-2 bg-neutral-950/60 rounded">
+              <div>Название</div>
+              <div className="text-right">Начало</div>
+              <div className="text-right">Окончание</div>
             </div>
-          ))}
-          {todayMarker && (
-            <div className="absolute top-0 bottom-0" style={{ left: `${todayMarker.left}%` }}>
-              <div className="w-px h-full bg-amber-400" />
-              <div className="-translate-x-1/2 text-[10px] text-amber-300 mt-1 whitespace-nowrap">
-                Сегодня
+          </div>
+          <div className="relative h-8 bg-neutral-950/60 rounded">
+            {ganttTicks.map((t) => (
+              <div key={t.label} className="absolute top-1 bottom-1" style={{ left: `${t.left}%` }}>
+                <div className="w-px h-full bg-neutral-700" />
+                <div className="-translate-x-1/2 text-[10px] text-neutral-400 mt-1 whitespace-nowrap">
+                  {t.label}
+                </div>
               </div>
-            </div>
-          )}
-        </div>
-        <div className="space-y-2">
-          {ganttGrouped.slice(0, 20).map(({ label, rows, spanLeft, spanWidth }) => (
-            <div key={`gantt-${label}`} className="space-y-2">
-              <div className="flex items-center gap-2 text-xs text-neutral-300">
-                <button
-                  className="px-2 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700"
-                  onClick={() => toggleGanttGroup(label)}
-                  title={ganttCollapsed[label] ? "Развернуть" : "Свернуть"}
-                >
-                  {ganttCollapsed[label] ? ">" : "v"}
-                </button>
-                <span className="text-neutral-400">
-                  {label} <span className="text-neutral-600">({rows.length})</span>
-                </span>
+            ))}
+            {todayMarker && (
+              <div className="absolute top-0 bottom-0" style={{ left: `${todayMarker.left}%` }}>
+                <div className="w-px h-full bg-amber-400" />
+                <div className="-translate-x-1/2 text-[10px] text-amber-300 whitespace-nowrap bg-neutral-950/90 px-1 rounded absolute -top-4">
+                  Сегодня
+                </div>
               </div>
-              <div className="relative h-6 bg-neutral-950/60 rounded">
-                {todayMarker && (
-                  <div className="absolute top-0 bottom-0" style={{ left: `${todayMarker.left}%` }}>
-                    <div className="w-px h-full bg-amber-400/60" />
+            )}
+          </div>
+          <div className="col-span-2 max-h-[520px] overflow-y-auto pr-2">
+            {ganttRows.map((row) => {
+              if (row.type === "group") {
+                return (
+                  <div key={`row-${row.label}`} className="grid grid-cols-[380px_1fr] gap-3">
+                    <div className="flex items-center gap-2 text-xs text-neutral-300 h-6 px-2">
+                      <button
+                        className="px-2 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700"
+                        onClick={() => toggleGanttGroup(row.label)}
+                        title={ganttCollapsed[row.label] ? "Развернуть" : "Свернуть"}
+                      >
+                        {ganttCollapsed[row.label] ? ">" : "v"}
+                      </button>
+                      <span className="text-neutral-400">
+                        {row.label} <span className="text-neutral-600">({row.rows.length})</span>
+                      </span>
+                    </div>
+                    <div className="relative h-6 bg-neutral-950/60 rounded">
+                      {todayMarker && (
+                        <div className="absolute top-0 bottom-0" style={{ left: `${todayMarker.left}%` }}>
+                          <div className="w-px h-full bg-amber-400/60" />
+                        </div>
+                      )}
+                      <div
+                        className="absolute top-1 bottom-1 rounded bg-emerald-600/70"
+                        style={{ left: `${row.spanLeft}%`, width: `${row.spanWidth}%` }}
+                        title={`Диапазон: ${row.label}`}
+                      />
+                    </div>
                   </div>
-                )}
-                <div
-                  className="absolute top-1 bottom-1 rounded bg-emerald-600/70"
-                  style={{ left: `${spanLeft}%`, width: `${spanWidth}%` }}
-                  title={`Диапазон: ${label}`}
-                />
-              </div>
-              {!ganttCollapsed[label] &&
-                rows.slice(0, 20).map(({ op, left, width }) => (
-                  <div key={op.id} className="relative h-7 bg-neutral-950/60 rounded">
+                );
+              }
+              return (
+                <div key={`row-${row.op.id}`} className="grid grid-cols-[380px_1fr] gap-3">
+                  <div className="grid grid-cols-[1fr_96px_96px] gap-2 px-2 h-7 items-center">
+                    <div className="truncate text-neutral-200">{row.op.name}</div>
+                    <div className="text-right text-neutral-400">{row.op.plan_start || "—"}</div>
+                    <div className="text-right text-neutral-400">{row.op.plan_finish || "—"}</div>
+                  </div>
+                  <div className="relative h-7 bg-neutral-950/60 rounded">
                     {todayMarker && (
                       <div className="absolute top-0 bottom-0" style={{ left: `${todayMarker.left}%` }}>
                         <div className="w-px h-full bg-amber-400/50" />
@@ -414,45 +474,51 @@ export default function GprPage() {
                     )}
                     <div
                       className="absolute top-1 bottom-1 rounded bg-neutral-800"
-                      style={{ left: `${left}%`, width: `${width}%` }}
+                      style={{ left: `${row.left}%`, width: `${row.width}%` }}
                     />
                     <div
                       className={`absolute top-1 bottom-1 rounded ${
-                        op.critical ? "bg-red-500" : "bg-sky-600"
+                        row.op.critical ? "bg-red-500" : "bg-sky-600"
                       }`}
-                      style={{ left: `${left}%`, width: `${width}%` }}
-                      title={`${op.code} • ${op.name}`}
+                      style={{ left: `${row.left}%`, width: `${row.width}%` }}
+                      title={row.op.name}
                     />
-                    {typeof op.progress_pct === "number" && (
+                    {typeof row.op.progress_pct === "number" && (
                       <div
                         className="absolute top-1 bottom-1 rounded bg-emerald-400/80"
                         style={{
-                          left: `${left}%`,
-                          width: `${(width * Math.max(0, Math.min(100, op.progress_pct))) / 100}%`,
+                          left: `${row.left}%`,
+                          width: `${(row.width * Math.max(0, Math.min(100, row.op.progress_pct))) / 100}%`,
                         }}
-                        title={`Прогресс: ${op.progress_pct.toFixed(1)}%`}
+                        title={`Прогресс: ${row.op.progress_pct.toFixed(1)}%`}
                       />
                     )}
+                    {typeof row.op.progress_pct === "number" && row.width >= 8 && (
+                      <div
+                        className="absolute inset-y-0 flex items-center justify-center text-[10px] font-semibold text-neutral-950"
+                        style={{ left: `${row.left}%`, width: `${row.width}%` }}
+                      >
+                        {row.op.progress_pct.toFixed(1)}%
+                      </div>
+                    )}
                     {todayMarker &&
-                      op.plan_start &&
-                      op.plan_finish &&
-                      todayMarker.date >= toDate(op.plan_start)! &&
-                      todayMarker.date <= toDate(op.plan_finish)! && (
+                      row.op.plan_start &&
+                      row.op.plan_finish &&
+                      todayMarker.date >= toDate(row.op.plan_start)! &&
+                      todayMarker.date <= toDate(row.op.plan_finish)! && (
                         <div
                           className="absolute -inset-[1px] rounded border border-amber-400/80"
-                          style={{ left: `${left}%`, width: `${width}%` }}
+                          style={{ left: `${row.left}%`, width: `${row.width}%` }}
                           title="Текущая операция"
                         />
                       )}
-                    <div className="absolute left-2 top-1 text-xs text-neutral-200 truncate">
-                      {op.code} — {op.name}
-                    </div>
                   </div>
-                ))}
-            </div>
-          ))}
+                </div>
+              );
+            })}
+          </div>
           {gantt.length === 0 && (
-            <div className="text-xs text-neutral-500">Нет операций с датами в выбранном периоде.</div>
+            <div className="col-span-2 text-xs text-neutral-500">Нет операций с датами в выбранном периоде.</div>
           )}
         </div>
       </div>

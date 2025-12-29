@@ -34,6 +34,15 @@ ALLOWED_ROLES_VIEW = (Role.admin, Role.pto, Role.finance, Role.manager, Role.vie
 ALLOWED_ROLES_EDIT = (Role.admin, Role.pto, Role.manager)
 
 
+def _is_valid_wbs(wbs_path: str | None, name: str | None) -> bool:
+    if not wbs_path or not wbs_path.strip():
+        return False
+    nm = (name or "").strip().lower()
+    if nm.startswith("иср"):
+        return False
+    return True
+
+
 @router.get("/operations", response_model=list[OperationOut])
 def get_operations(
     project_id: int = Query(...),
@@ -58,6 +67,8 @@ def get_operations(
     )
     out: list[OperationOut] = []
     for op, wbs_path in rows:
+        if not _is_valid_wbs(wbs_path, op.name):
+            continue
         out.append(
             OperationOut(
                 id=op.id,
@@ -211,6 +222,8 @@ def gantt(
     ops: list[Operation] = []
     wbs_map: dict[int, str | None] = {}
     for op, wbs_path in ops_rows:
+        if not _is_valid_wbs(wbs_path, op.name):
+            continue
         ops.append(op)
         wbs_map[op.id] = wbs_path
 

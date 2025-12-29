@@ -2,14 +2,11 @@
 import { useEffect, useState } from "react";
 import Shell from "../../../components/Shell";
 import Filters, { FiltersValue } from "../../../components/Filters";
-import { apiFetch } from "../../../lib/api";
+import { apiFetch, getProjectPlanRange } from "../../../lib/api";
 
 export default function ProgressPage() {
   const [filters, setFilters] = useState<FiltersValue>(() => {
-    const today = new Date();
-    const start = new Date(today.getFullYear(), today.getMonth(), 1);
-    const iso = (d: Date) => d.toISOString().slice(0, 10);
-    return { projectId: 1, dateFrom: iso(start), dateTo: iso(today), wbsPath: "" };
+    return { projectId: 1, dateFrom: "", dateTo: "", wbsPath: "" };
   });
   const [by, setBy] = useState<"wbs"|"discipline"|"block"|"floor"|"ugpr">("discipline");
   const [scenario, setScenario] = useState<"plan" | "forecast" | "actual">("plan");
@@ -22,7 +19,40 @@ export default function ProgressPage() {
     setTable(t);
   }
 
-  useEffect(()=>{ load(filters); }, []);
+  useEffect(() => {
+    let ignore = false;
+    async function init() {
+      const today = new Date();
+      const start = new Date(today.getFullYear(), today.getMonth(), 1);
+      const iso = (d: Date) => d.toISOString().slice(0, 10);
+      try {
+        const r = await getProjectPlanRange(filters.projectId);
+        const planStart = r?.plan_start ? String(r.plan_start).slice(0, 10) : null;
+        const planFinish = r?.plan_finish ? String(r.plan_finish).slice(0, 10) : null;
+        if ((planStart || planFinish) && !ignore) {
+          const v = {
+            ...filters,
+            dateFrom: planStart || iso(start),
+            dateTo: planFinish || iso(today),
+          };
+          setFilters(v);
+          await load(v);
+          return;
+        }
+      } catch {
+        // ignore
+      }
+      if (!ignore) {
+        const v = { ...filters, dateFrom: iso(start), dateTo: iso(today) };
+        setFilters(v);
+        await load(v);
+      }
+    }
+    init();
+    return () => {
+      ignore = true;
+    };
+  }, []);
 
   return (
     <Shell title="Прогресс">

@@ -39,3 +39,22 @@ class MoneySeriesPoint(BaseModel):
 class MoneySeriesOut(BaseModel):
     series: list[MoneySeriesPoint]
     plan: list[MoneySeriesPoint] | None = None
+
+
+class UgprTableRow(BaseModel):
+    operation_code: str
+    operation_name: str
+    plan_lcp: float
+    fact_lcp: float
+    plan_period: float
+    fact_period: float
+    plan_month: float
+    fact_month: float
+    plan_week: float
+    fact_week: float
+    plan_day: float
+    fact_day: float
+
+
+class UgprTableOut(BaseModel):
+    rows: list[UgprTableRow]

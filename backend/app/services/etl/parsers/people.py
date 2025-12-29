@@ -31,7 +31,14 @@ def parse_people_tech(path: str, sheet: str = "Люди техника") -> tupl
     m=m[m["qty"]!=0].copy()
     m.rename(columns={"наименование":"resource_name","категория":"resource_category","ед. изм":"unit","план/факт":"scenario"}, inplace=True)
 
-    # Normalize scenario
-    m["scenario"]=m["scenario"].astype(str).str.lower().str.strip()
-    m["scenario"]=m["scenario"].replace({"план":"plan","факт":"fact"})
+    # Normalize scenario (split plan/fact rows)
+    def _norm_scenario(v: str) -> str:
+        s = str(v or "").strip().lower()
+        if "факт" in s or "fact" in s:
+            return "fact"
+        if "план" in s or "plan" in s:
+            return "plan"
+        return "fact"
+
+    m["scenario"] = m["scenario"].apply(_norm_scenario)
     return m[["resource_name","resource_category","unit","scenario","date","qty"]], errors

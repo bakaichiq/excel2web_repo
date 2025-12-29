@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 export type FiltersValue = {
   projectId: number;
@@ -10,6 +10,9 @@ export type FiltersValue = {
 
 export default function Filters({ initial, onChange }: { initial: FiltersValue; onChange: (v: FiltersValue) => void }) {
   const [v, setV] = useState<FiltersValue>(initial);
+  useEffect(() => {
+    setV(initial);
+  }, [initial.projectId, initial.dateFrom, initial.dateTo, initial.wbsPath]);
   return (
     <div className="flex flex-wrap gap-3 items-end">
       <label className="text-sm">

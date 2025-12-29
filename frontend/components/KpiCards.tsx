@@ -1,8 +1,9 @@
 "use client";
 export default function KpiCards({ kpi }: { kpi: any }) {
+  const fmt1 = (v: any) => (typeof v === "number" ? v.toFixed(1) : v ?? "—");
   const items = [
-    { label: "Факт", value: kpi?.fact_qty ?? "—" },
-    { label: "План", value: kpi?.plan_qty ?? "—" },
+    { label: "Факт", value: fmt1(kpi?.fact_qty) },
+    { label: "План", value: fmt1(kpi?.plan_qty) },
     { label: "Прогресс %", value: kpi ? kpi.progress_pct.toFixed(2) : "—" },
     { label: "Manhours", value: kpi?.manhours ?? "—" },
     { label: "Производительность", value: kpi?.productivity ?? "—" }

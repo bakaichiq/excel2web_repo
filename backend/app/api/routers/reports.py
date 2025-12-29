@@ -5,8 +5,8 @@ from fastapi.responses import FileResponse
 
 from app.core.deps import get_db, require_roles
 from app.db.models.user import Role
-from app.schemas.reports import KPIOut, PlanFactSeries, PlanFactTable, MoneySeriesOut
-from app.services.reports.service import kpi as kpi_calc, plan_fact_series as pfs_calc, plan_fact_table_by as pft_calc, pnl as pnl_calc, cashflow as cf_calc, ugpr_series as ugpr_calc
+from app.schemas.reports import KPIOut, PlanFactSeries, PlanFactTable, MoneySeriesOut, UgprTableOut
+from app.services.reports.service import kpi as kpi_calc, plan_fact_series as pfs_calc, plan_fact_table_by as pft_calc, pnl as pnl_calc, cashflow as cf_calc, ugpr_series as ugpr_calc, ugpr_operation_table as ugpr_table_calc, manhours_series as manhours_series_calc
 from app.services.exports.exporter import export_plan_fact_xlsx, export_kpi_pdf, default_export_path
 from app.core.config import settings
 
@@ -91,6 +91,32 @@ def ugpr_series(
     _user=Depends(require_roles(Role.admin, Role.pto, Role.finance, Role.manager, Role.viewer)),
 ):
     return ugpr_calc(db, project_id, date_from, date_to, granularity=granularity, wbs_path=wbs_path, import_run_id=import_run_id)
+
+
+@router.get("/ugpr/table", response_model=UgprTableOut)
+def ugpr_table(
+    project_id: int = Query(...),
+    date_from: dt.date = Query(...),
+    date_to: dt.date = Query(...),
+    wbs_path: str | None = Query(None),
+    import_run_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+    _user=Depends(require_roles(Role.admin, Role.pto, Role.finance, Role.manager, Role.viewer)),
+):
+    return ugpr_table_calc(db, project_id, date_from, date_to, wbs_path=wbs_path, import_run_id=import_run_id)
+
+
+@router.get("/manhours/series", response_model=PlanFactSeries)
+def manhours_series(
+    project_id: int = Query(...),
+    date_from: dt.date = Query(...),
+    date_to: dt.date = Query(...),
+    granularity: str = Query("month", pattern="^(day|week|month)$"),
+    import_run_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+    _user=Depends(require_roles(Role.admin, Role.pto, Role.finance, Role.manager, Role.viewer)),
+):
+    return manhours_series_calc(db, project_id, date_from, date_to, granularity=granularity, import_run_id=import_run_id)
 
 @router.get("/export/plan-fact.xlsx")
 def export_plan_fact(
