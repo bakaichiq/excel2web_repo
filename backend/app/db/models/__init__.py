@@ -4,6 +4,7 @@ from app.db.models.project import Project
 from app.db.models.wbs import WBS
 from app.db.models.operation import Operation
 from app.db.models.operation_dependency import OperationDependency
+from app.db.models.sales import SalesMonthly
 from app.db.models.resource import Resource
 from app.db.models.fin_account import FinAccount
 from app.db.models.import_run import ImportRun

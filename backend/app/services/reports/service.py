@@ -15,6 +15,7 @@ from app.db.models.baseline import BaselineVolume
 from app.db.models.operation import Operation
 from app.db.models.wbs import WBS
 from app.db.models.import_run import ImportRun
+from app.db.models.sales import SalesMonthly
 
 Granularity = Literal["day", "week", "month"]
 
@@ -67,6 +68,16 @@ def _apply_import_run_filter(q, model, import_run_id: int | None):
     if import_run_id is None:
         return q.filter(model.import_run_id.is_(None))
     return q.filter(or_(model.import_run_id == import_run_id, model.import_run_id.is_(None)))
+
+
+def _month_overlap_days(date_from: dt.date, date_to: dt.date, month_start: dt.date) -> int:
+    m_start = month_start
+    m_end = m_start + dt.timedelta(days=_month_days(m_start) - 1)
+    overlap_start = max(date_from, m_start)
+    overlap_end = min(date_to, m_end)
+    if overlap_start > overlap_end:
+        return 0
+    return (overlap_end - overlap_start).days + 1
 
 
 def _plan_month_rows(
@@ -698,6 +709,495 @@ def manhours_series(
         return out
 
     return {"plan": to_points(plan_rows), "fact": to_points(fact_rows)}
+
+
+def floor_summary(
+    db: Session,
+    project_id: int,
+    date_from: dt.date,
+    date_to: dt.date,
+    wbs_path: str | None = None,
+    import_run_id: int | None = None,
+):
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
+    month_from = dt.date(date_from.year, date_from.month, 1)
+    month_to = dt.date(date_to.year, date_to.month, 1)
+
+    baseline_floor = aliased(BaselineVolume)
+    plan_q = (
+        db.query(
+            PlanVolumeMonthly.operation_code.label("code"),
+            func.coalesce(Operation.floor, baseline_floor.floor).label("floor"),
+            func.coalesce(Operation.block, baseline_floor.block).label("block"),
+            PlanVolumeMonthly.month.label("month"),
+            func.coalesce(func.sum(PlanVolumeMonthly.qty), 0.0).label("plan"),
+        )
+        .join(
+            Operation,
+            and_(
+                Operation.project_id == PlanVolumeMonthly.project_id,
+                Operation.code == PlanVolumeMonthly.operation_code,
+            ),
+        )
+        .outerjoin(
+            baseline_floor,
+            and_(
+                baseline_floor.project_id == PlanVolumeMonthly.project_id,
+                baseline_floor.operation_code == PlanVolumeMonthly.operation_code,
+            ),
+        )
+        .filter(
+            PlanVolumeMonthly.project_id == project_id,
+            PlanVolumeMonthly.scenario == "plan",
+            PlanVolumeMonthly.month >= month_from,
+            PlanVolumeMonthly.month <= month_to,
+        )
+    )
+    if wbs_path:
+        plan_q = plan_q.join(WBS, Operation.wbs_id == WBS.id).filter(WBS.path.ilike(f"{wbs_path}%"))
+    plan_q = _apply_import_run_filter(plan_q, PlanVolumeMonthly, import_run_id).group_by(
+        PlanVolumeMonthly.operation_code,
+        func.coalesce(Operation.floor, baseline_floor.floor),
+        func.coalesce(Operation.block, baseline_floor.block),
+        PlanVolumeMonthly.month,
+    )
+    plan_rows = plan_q.all()
+
+    plan_by_op: dict[str, float] = {}
+    floor_by_op: dict[str, str | None] = {}
+    block_by_op: dict[str, str | None] = {}
+    for r in plan_rows:
+        days = _month_overlap_days(date_from, date_to, r.month)
+        if days <= 0:
+            continue
+        plan_by_op[r.code] = plan_by_op.get(r.code, 0.0) + (float(r.plan or 0.0) / _month_days(r.month)) * days
+        floor_by_op[r.code] = r.floor
+        block_by_op[r.code] = r.block
+
+    fact_q = (
+        db.query(
+            FactVolumeDaily.operation_code.label("code"),
+            func.coalesce(Operation.floor, baseline_floor.floor, FactVolumeDaily.floor).label("floor"),
+            func.coalesce(Operation.block, baseline_floor.block, FactVolumeDaily.block).label("block"),
+            func.coalesce(func.sum(FactVolumeDaily.qty), 0.0).label("fact"),
+        )
+        .join(
+            Operation,
+            and_(
+                Operation.project_id == FactVolumeDaily.project_id,
+                Operation.code == FactVolumeDaily.operation_code,
+            ),
+        )
+        .outerjoin(
+            baseline_floor,
+            and_(
+                baseline_floor.project_id == FactVolumeDaily.project_id,
+                baseline_floor.operation_code == FactVolumeDaily.operation_code,
+            ),
+        )
+        .filter(
+            FactVolumeDaily.project_id == project_id,
+            FactVolumeDaily.date >= date_from,
+            FactVolumeDaily.date <= date_to,
+        )
+    )
+    if wbs_path:
+        fact_q = fact_q.join(WBS, Operation.wbs_id == WBS.id).filter(WBS.path.ilike(f"{wbs_path}%"))
+    fact_q = _apply_import_run_filter(fact_q, FactVolumeDaily, import_run_id).group_by(
+        FactVolumeDaily.operation_code,
+        func.coalesce(Operation.floor, baseline_floor.floor, FactVolumeDaily.floor),
+        func.coalesce(Operation.block, baseline_floor.block, FactVolumeDaily.block),
+    )
+    fact_rows = fact_q.all()
+
+    fact_by_op: dict[str, float] = {}
+    for r in fact_rows:
+        fact_by_op[r.code] = float(r.fact or 0.0)
+        floor_by_op.setdefault(r.code, r.floor)
+        block_by_op.setdefault(r.code, r.block)
+
+    floors: dict[tuple[str, str], list[float]] = {}
+    ops_count: dict[tuple[str, str], int] = {}
+    for code, plan in plan_by_op.items():
+        if plan <= 0:
+            continue
+        floor = floor_by_op.get(code) or "—"
+        block = block_by_op.get(code)
+        fact = fact_by_op.get(code, 0.0)
+        pct = (fact / plan * 100.0) if plan > 0 else 0.0
+        floors.setdefault((block, floor), []).append(pct)
+        ops_count[(block, floor)] = ops_count.get((block, floor), 0) + 1
+
+    # include floors that only have fact (no plan) so they still appear
+    for code, fact in fact_by_op.items():
+        if code in plan_by_op:
+            continue
+        floor = floor_by_op.get(code) or "—"
+        block = block_by_op.get(code)
+        floors.setdefault((block, floor), []).append(0.0)
+        ops_count[(block, floor)] = ops_count.get((block, floor), 0) + 1
+
+    rows = []
+    for (block, floor), pcts in floors.items():
+        if not pcts:
+            continue
+        rows.append(
+            {
+                "block": block,
+                "floor": floor,
+                "progress_pct": float(sum(pcts) / len(pcts)),
+                "operations_count": int(ops_count.get((block, floor), 0)),
+            }
+        )
+
+    return {"rows": rows}
+
+
+def floor_operations(
+    db: Session,
+    project_id: int,
+    date_from: dt.date,
+    date_to: dt.date,
+    floor: str,
+    block: str | None = None,
+    wbs_path: str | None = None,
+    import_run_id: int | None = None,
+):
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
+    month_from = dt.date(date_from.year, date_from.month, 1)
+    month_to = dt.date(date_to.year, date_to.month, 1)
+
+    baseline_floor = aliased(BaselineVolume)
+    plan_q = (
+        db.query(
+            PlanVolumeMonthly.operation_code.label("code"),
+            func.coalesce(func.sum(PlanVolumeMonthly.qty), 0.0).label("plan"),
+            PlanVolumeMonthly.month.label("month"),
+        )
+        .join(
+            Operation,
+            and_(
+                Operation.project_id == PlanVolumeMonthly.project_id,
+                Operation.code == PlanVolumeMonthly.operation_code,
+            ),
+        )
+        .outerjoin(
+            baseline_floor,
+            and_(
+                baseline_floor.project_id == PlanVolumeMonthly.project_id,
+                baseline_floor.operation_code == PlanVolumeMonthly.operation_code,
+            ),
+        )
+        .filter(
+            PlanVolumeMonthly.project_id == project_id,
+            PlanVolumeMonthly.scenario == "plan",
+            PlanVolumeMonthly.month >= month_from,
+            PlanVolumeMonthly.month <= month_to,
+            func.coalesce(Operation.floor, baseline_floor.floor) == floor,
+        )
+    )
+    if block:
+        plan_q = plan_q.filter(func.coalesce(Operation.block, baseline_floor.block) == block)
+    if wbs_path:
+        plan_q = plan_q.join(WBS, Operation.wbs_id == WBS.id).filter(WBS.path.ilike(f"{wbs_path}%"))
+    plan_q = _apply_import_run_filter(plan_q, PlanVolumeMonthly, import_run_id).group_by(
+        PlanVolumeMonthly.operation_code,
+        PlanVolumeMonthly.month,
+    )
+    plan_rows = plan_q.all()
+
+    plan_by_op: dict[str, float] = {}
+    for r in plan_rows:
+        days = _month_overlap_days(date_from, date_to, r.month)
+        if days <= 0:
+            continue
+        plan_by_op[r.code] = plan_by_op.get(r.code, 0.0) + (float(r.plan or 0.0) / _month_days(r.month)) * days
+
+    fact_q = (
+        db.query(
+            FactVolumeDaily.operation_code.label("code"),
+            func.coalesce(func.sum(FactVolumeDaily.qty), 0.0).label("fact"),
+        )
+        .join(
+            Operation,
+            and_(
+                Operation.project_id == FactVolumeDaily.project_id,
+                Operation.code == FactVolumeDaily.operation_code,
+            ),
+        )
+        .outerjoin(
+            baseline_floor,
+            and_(
+                baseline_floor.project_id == FactVolumeDaily.project_id,
+                baseline_floor.operation_code == FactVolumeDaily.operation_code,
+            ),
+        )
+        .filter(
+            FactVolumeDaily.project_id == project_id,
+            FactVolumeDaily.date >= date_from,
+            FactVolumeDaily.date <= date_to,
+            func.coalesce(Operation.floor, baseline_floor.floor, FactVolumeDaily.floor) == floor,
+        )
+    )
+    if block:
+        fact_q = fact_q.filter(func.coalesce(Operation.block, baseline_floor.block, FactVolumeDaily.block) == block)
+    if wbs_path:
+        fact_q = fact_q.join(WBS, Operation.wbs_id == WBS.id).filter(WBS.path.ilike(f"{wbs_path}%"))
+    fact_q = _apply_import_run_filter(fact_q, FactVolumeDaily, import_run_id).group_by(
+        FactVolumeDaily.operation_code,
+    )
+    fact_rows = fact_q.all()
+
+    fact_by_op = {r.code: float(r.fact or 0.0) for r in fact_rows}
+
+    codes = set(plan_by_op.keys()) | set(fact_by_op.keys())
+    if not codes:
+        return {"rows": []}
+
+    op_rows = (
+        db.query(Operation.code, Operation.name)
+        .filter(
+            Operation.project_id == project_id,
+            Operation.code.in_(list(codes)),
+        )
+        .all()
+    )
+    name_by_code = {code: name for code, name in op_rows}
+
+    out = []
+    for code in codes:
+        plan = float(plan_by_op.get(code, 0.0))
+        fact = float(fact_by_op.get(code, 0.0))
+        if plan <= 0 and fact <= 0:
+            continue
+        pct = (fact / plan * 100.0) if plan > 0 else 0.0
+        out.append(
+            {
+                "operation_code": code,
+                "operation_name": name_by_code.get(code) or code,
+                "progress_pct": float(pct),
+            }
+        )
+
+    out.sort(key=lambda x: x["progress_pct"], reverse=True)
+    return {"rows": out}
+
+
+def floor_series(
+    db: Session,
+    project_id: int,
+    date_from: dt.date,
+    date_to: dt.date,
+    floor: str,
+    block: str | None = None,
+    wbs_path: str | None = None,
+    import_run_id: int | None = None,
+):
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
+    months = _daterange_month_starts(date_from, date_to)
+
+    baseline_floor = aliased(BaselineVolume)
+    plan_q = (
+        db.query(
+            PlanVolumeMonthly.month.label("month"),
+            PlanVolumeMonthly.operation_code.label("code"),
+            func.coalesce(func.sum(PlanVolumeMonthly.qty), 0.0).label("plan"),
+            PlanVolumeMonthly.scenario.label("scenario"),
+        )
+        .join(
+            Operation,
+            and_(
+                Operation.project_id == PlanVolumeMonthly.project_id,
+                Operation.code == PlanVolumeMonthly.operation_code,
+            ),
+        )
+        .outerjoin(
+            baseline_floor,
+            and_(
+                baseline_floor.project_id == PlanVolumeMonthly.project_id,
+                baseline_floor.operation_code == PlanVolumeMonthly.operation_code,
+            ),
+        )
+        .filter(
+            PlanVolumeMonthly.project_id == project_id,
+            PlanVolumeMonthly.month >= dt.date(date_from.year, date_from.month, 1),
+            PlanVolumeMonthly.month <= dt.date(date_to.year, date_to.month, 1),
+            func.coalesce(Operation.floor, baseline_floor.floor) == floor,
+        )
+    )
+    if block:
+        plan_q = plan_q.filter(func.coalesce(Operation.block, baseline_floor.block) == block)
+    if block:
+        plan_q = plan_q.filter(Operation.block == block)
+    if wbs_path:
+        plan_q = plan_q.join(WBS, Operation.wbs_id == WBS.id).filter(WBS.path.ilike(f"{wbs_path}%"))
+    plan_q = _apply_import_run_filter(plan_q, PlanVolumeMonthly, import_run_id).group_by(
+        PlanVolumeMonthly.month,
+        PlanVolumeMonthly.operation_code,
+        PlanVolumeMonthly.scenario,
+    )
+    plan_rows = plan_q.all()
+
+    plan_by_month: dict[dt.date, dict[str, float]] = {}
+    forecast_by_month: dict[dt.date, dict[str, float]] = {}
+    for r in plan_rows:
+        if r.scenario == "forecast":
+            forecast_by_month.setdefault(r.month, {})[r.code] = float(r.plan or 0.0)
+        else:
+            plan_by_month.setdefault(r.month, {})[r.code] = float(r.plan or 0.0)
+
+    fact_q = (
+        db.query(
+            cast(func.date_trunc("month", FactVolumeDaily.date), Date).label("month"),
+            FactVolumeDaily.operation_code.label("code"),
+            func.coalesce(func.sum(FactVolumeDaily.qty), 0.0).label("fact"),
+        )
+        .join(
+            Operation,
+            and_(
+                Operation.project_id == FactVolumeDaily.project_id,
+                Operation.code == FactVolumeDaily.operation_code,
+            ),
+        )
+        .outerjoin(
+            baseline_floor,
+            and_(
+                baseline_floor.project_id == FactVolumeDaily.project_id,
+                baseline_floor.operation_code == FactVolumeDaily.operation_code,
+            ),
+        )
+        .filter(
+            FactVolumeDaily.project_id == project_id,
+            FactVolumeDaily.date >= date_from,
+            FactVolumeDaily.date <= date_to,
+            func.coalesce(Operation.floor, baseline_floor.floor, FactVolumeDaily.floor) == floor,
+        )
+    )
+    if block:
+        fact_q = fact_q.filter(func.coalesce(Operation.block, baseline_floor.block, FactVolumeDaily.block) == block)
+    if block:
+        fact_q = fact_q.filter(Operation.block == block)
+    if wbs_path:
+        fact_q = fact_q.join(WBS, Operation.wbs_id == WBS.id).filter(WBS.path.ilike(f"{wbs_path}%"))
+    fact_q = _apply_import_run_filter(fact_q, FactVolumeDaily, import_run_id).group_by(
+        cast(func.date_trunc("month", FactVolumeDaily.date), Date),
+        FactVolumeDaily.operation_code,
+    )
+    fact_rows = fact_q.all()
+
+    fact_by_month: dict[dt.date, dict[str, float]] = {}
+    for r in fact_rows:
+        fact_by_month.setdefault(r.month, {})[r.code] = float(r.fact or 0.0)
+
+    plan_out = []
+    fact_out = []
+    forecast_out = []
+
+    for m in months:
+        plan_map = plan_by_month.get(m, {})
+        if not plan_map:
+            continue
+        fact_map = fact_by_month.get(m, {})
+        ratios = []
+        for code, plan_val in plan_map.items():
+            if plan_val <= 0:
+                continue
+            ratios.append((fact_map.get(code, 0.0) / plan_val) * 100.0)
+        if not ratios:
+            continue
+        avg_fact = sum(ratios) / len(ratios)
+        plan_out.append({"period": m.isoformat(), "value": 100.0})
+        fact_out.append({"period": m.isoformat(), "value": float(avg_fact)})
+
+        forecast_map = forecast_by_month.get(m, {})
+        if forecast_map:
+            fr = []
+            for code, forecast_val in forecast_map.items():
+                plan_val = plan_map.get(code, 0.0)
+                if plan_val <= 0:
+                    continue
+                fr.append((forecast_val / plan_val) * 100.0)
+            if fr:
+                forecast_out.append({"period": m.isoformat(), "value": float(sum(fr) / len(fr))})
+
+    return {"plan": plan_out, "fact": fact_out, "forecast": forecast_out or None}
+
+
+def sales_series(
+    db: Session,
+    project_id: int,
+    date_from: dt.date,
+    date_to: dt.date,
+    import_run_id: int | None = None,
+):
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
+    month_from = dt.date(date_from.year, date_from.month, 1)
+    month_to = dt.date(date_to.year, date_to.month, 1)
+
+    def _rows_for(scenario: str):
+        qry = (
+            db.query(SalesMonthly.month.label("period"), func.coalesce(func.sum(SalesMonthly.area_m2), 0.0).label("value"))
+            .filter(
+                SalesMonthly.project_id == project_id,
+                SalesMonthly.month >= month_from,
+                SalesMonthly.month <= month_to,
+                SalesMonthly.scenario == scenario,
+            )
+        )
+        qry = _apply_import_run_filter(qry, SalesMonthly, import_run_id)
+        return qry.group_by(SalesMonthly.month).order_by(SalesMonthly.month).all()
+
+    def _to_points(rows):
+        out = []
+        for p, v in rows:
+            period = p.isoformat() if hasattr(p, "isoformat") else str(p)
+            out.append({"period": period, "value": float(v or 0.0)})
+        return out
+
+    return {"plan": _to_points(_rows_for("plan")), "fact": _to_points(_rows_for("fact"))}
+
+
+def sales_kpi(
+    db: Session,
+    project_id: int,
+    date_from: dt.date,
+    date_to: dt.date,
+    import_run_id: int | None = None,
+):
+    import_run_id = _effective_import_run_id(db, project_id, import_run_id)
+    month_from = dt.date(date_from.year, date_from.month, 1)
+    month_to = dt.date(date_to.year, date_to.month, 1)
+
+    def _sum_for(scenario: str) -> float:
+        qry = (
+            db.query(func.coalesce(func.sum(SalesMonthly.area_m2), 0.0))
+            .filter(
+                SalesMonthly.project_id == project_id,
+                SalesMonthly.month >= month_from,
+                SalesMonthly.month <= month_to,
+                SalesMonthly.scenario == scenario,
+            )
+        )
+        qry = _apply_import_run_filter(qry, SalesMonthly, import_run_id)
+        return float(qry.scalar() or 0.0)
+
+    plan_m2 = _sum_for("plan")
+    fact_m2 = _sum_for("fact")
+    remaining_m2 = max(plan_m2 - fact_m2, 0.0)
+    variance_m2 = fact_m2 - plan_m2
+    progress_pct = (fact_m2 / plan_m2 * 100.0) if plan_m2 > 0 else 0.0
+
+    return dict(
+        project_id=project_id,
+        date_from=date_from,
+        date_to=date_to,
+        plan_m2=float(plan_m2),
+        fact_m2=float(fact_m2),
+        sold_m2=float(fact_m2),
+        remaining_m2=float(remaining_m2),
+        variance_m2=float(variance_m2),
+        progress_pct=float(progress_pct),
+    )
 
 
 def ugpr_operation_table(

@@ -11,6 +11,7 @@ export default function UgprPage() {
   });
   const [series, setSeries] = useState<any>(null);
   const [table, setTable] = useState<any>(null);
+  const [kpi, setKpi] = useState<any>(null);
   const [granularity, setGranularity] = useState<"day" | "week" | "month">("month");
   const [error, setError] = useState<string | null>(null);
 
@@ -23,6 +24,8 @@ export default function UgprPage() {
       setSeries(r);
       const t = await apiFetch(`/reports/ugpr/table${q.replace(`&granularity=${g}`, "")}`);
       setTable(t);
+      const k = await apiFetch(`/reports/kpi${q.replace(`&granularity=${g}`, "")}`);
+      setKpi(k);
     } catch (e: any) {
       setError(e?.message || "Ошибка загрузки УГПР");
     }
@@ -63,6 +66,24 @@ export default function UgprPage() {
     };
   }, []);
 
+  const factTotal = Array.isArray(series?.series)
+    ? series.series.reduce((acc: number, p: any) => acc + Number(p?.value ?? 0), 0)
+    : 0;
+  const planTotal = Array.isArray(series?.plan)
+    ? series.plan.reduce((acc: number, p: any) => acc + Number(p?.value ?? 0), 0)
+    : 0;
+  const varianceTotal = factTotal - planTotal;
+  const days =
+    filters.dateFrom && filters.dateTo
+      ? Math.max(1, Math.round((new Date(filters.dateTo).getTime() - new Date(filters.dateFrom).getTime()) / 86400000) + 1)
+      : 1;
+  const pacePerDay = factTotal / days;
+  const manhours = Number(kpi?.manhours ?? 0);
+  const productivityMoney = manhours > 0 ? factTotal / manhours : null;
+
+  const fmtMoney = (v: number | null) =>
+    v === null ? "—" : `${Number(v).toLocaleString("ru-RU", { maximumFractionDigits: 0 })} сом`;
+
   return (
     <Shell title="УГПР">
       <div className="flex flex-wrap items-end gap-4">
@@ -98,6 +119,30 @@ export default function UgprPage() {
       </div>
 
       {error && <div className="mt-3 text-sm text-red-400">{error}</div>}
+
+      <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mt-4">
+        <div className="rounded-xl bg-neutral-900 border border-neutral-800 p-4">
+          <div className="text-xs text-neutral-400">Освоено</div>
+          <div className="text-xl font-semibold mt-1">{fmtMoney(factTotal)}</div>
+        </div>
+        <div className="rounded-xl bg-neutral-900 border border-neutral-800 p-4">
+          <div className="text-xs text-neutral-400">План</div>
+          <div className="text-xl font-semibold mt-1">{fmtMoney(planTotal)}</div>
+        </div>
+        <div className="rounded-xl bg-neutral-900 border border-neutral-800 p-4">
+          <div className="text-xs text-neutral-400">Отклонение</div>
+          <div className="text-xl font-semibold mt-1">{fmtMoney(varianceTotal)}</div>
+        </div>
+        <div className="rounded-xl bg-neutral-900 border border-neutral-800 p-4">
+          <div className="text-xs text-neutral-400">Темп в день</div>
+          <div className="text-xl font-semibold mt-1">{fmtMoney(pacePerDay)}</div>
+        </div>
+        <div className="rounded-xl bg-neutral-900 border border-neutral-800 p-4">
+          <div className="text-xs text-neutral-400">Выработка</div>
+          <div className="text-xl font-semibold mt-1">{productivityMoney ? fmtMoney(productivityMoney) : "—"}</div>
+          <div className="text-[11px] text-neutral-500 mt-1">сом/ч</div>
+        </div>
+      </div>
 
       <MoneyChart title="Динамика освоения (сом)" series={series} />
 

@@ -5,8 +5,32 @@ from fastapi.responses import FileResponse
 
 from app.core.deps import get_db, require_roles
 from app.db.models.user import Role
-from app.schemas.reports import KPIOut, PlanFactSeries, PlanFactTable, MoneySeriesOut, UgprTableOut
-from app.services.reports.service import kpi as kpi_calc, plan_fact_series as pfs_calc, plan_fact_table_by as pft_calc, pnl as pnl_calc, cashflow as cf_calc, ugpr_series as ugpr_calc, ugpr_operation_table as ugpr_table_calc, manhours_series as manhours_series_calc
+from app.schemas.reports import (
+    KPIOut,
+    PlanFactSeries,
+    PlanFactTable,
+    MoneySeriesOut,
+    UgprTableOut,
+    SalesKPIOut,
+    FloorSummaryOut,
+    FloorOperationOut,
+    FloorSeriesOut,
+)
+from app.services.reports.service import (
+    kpi as kpi_calc,
+    plan_fact_series as pfs_calc,
+    plan_fact_table_by as pft_calc,
+    pnl as pnl_calc,
+    cashflow as cf_calc,
+    ugpr_series as ugpr_calc,
+    ugpr_operation_table as ugpr_table_calc,
+    manhours_series as manhours_series_calc,
+    sales_series as sales_series_calc,
+    sales_kpi as sales_kpi_calc,
+    floor_summary as floor_summary_calc,
+    floor_operations as floor_operations_calc,
+    floor_series as floor_series_calc,
+)
 from app.services.exports.exporter import export_plan_fact_xlsx, export_kpi_pdf, default_export_path
 from app.core.config import settings
 
@@ -117,6 +141,91 @@ def manhours_series(
     _user=Depends(require_roles(Role.admin, Role.pto, Role.finance, Role.manager, Role.viewer)),
 ):
     return manhours_series_calc(db, project_id, date_from, date_to, granularity=granularity, import_run_id=import_run_id)
+
+
+@router.get("/sales/kpi", response_model=SalesKPIOut)
+def sales_kpi(
+    project_id: int = Query(...),
+    date_from: dt.date = Query(...),
+    date_to: dt.date = Query(...),
+    import_run_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+    _user=Depends(require_roles(Role.admin, Role.pto, Role.finance, Role.manager, Role.viewer)),
+):
+    return sales_kpi_calc(db, project_id, date_from, date_to, import_run_id=import_run_id)
+
+
+@router.get("/sales/series", response_model=PlanFactSeries)
+def sales_series(
+    project_id: int = Query(...),
+    date_from: dt.date = Query(...),
+    date_to: dt.date = Query(...),
+    import_run_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+    _user=Depends(require_roles(Role.admin, Role.pto, Role.finance, Role.manager, Role.viewer)),
+):
+    return sales_series_calc(db, project_id, date_from, date_to, import_run_id=import_run_id)
+
+
+@router.get("/floors/summary", response_model=FloorSummaryOut)
+def floors_summary(
+    project_id: int = Query(...),
+    date_from: dt.date = Query(...),
+    date_to: dt.date = Query(...),
+    wbs_path: str | None = Query(None),
+    import_run_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+    _user=Depends(require_roles(Role.admin, Role.pto, Role.finance, Role.manager, Role.viewer)),
+):
+    return floor_summary_calc(db, project_id, date_from, date_to, wbs_path=wbs_path, import_run_id=import_run_id)
+
+
+@router.get("/floors/operations", response_model=FloorOperationOut)
+def floor_operations(
+    project_id: int = Query(...),
+    date_from: dt.date = Query(...),
+    date_to: dt.date = Query(...),
+    floor: str = Query(...),
+    block: str | None = Query(None),
+    wbs_path: str | None = Query(None),
+    import_run_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+    _user=Depends(require_roles(Role.admin, Role.pto, Role.finance, Role.manager, Role.viewer)),
+):
+    return floor_operations_calc(
+        db,
+        project_id,
+        date_from,
+        date_to,
+        floor=floor,
+        block=block,
+        wbs_path=wbs_path,
+        import_run_id=import_run_id,
+    )
+
+
+@router.get("/floors/series", response_model=FloorSeriesOut)
+def floor_series(
+    project_id: int = Query(...),
+    date_from: dt.date = Query(...),
+    date_to: dt.date = Query(...),
+    floor: str = Query(...),
+    block: str | None = Query(None),
+    wbs_path: str | None = Query(None),
+    import_run_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+    _user=Depends(require_roles(Role.admin, Role.pto, Role.finance, Role.manager, Role.viewer)),
+):
+    return floor_series_calc(
+        db,
+        project_id,
+        date_from,
+        date_to,
+        floor=floor,
+        block=block,
+        wbs_path=wbs_path,
+        import_run_id=import_run_id,
+    )
 
 @router.get("/export/plan-fact.xlsx")
 def export_plan_fact(

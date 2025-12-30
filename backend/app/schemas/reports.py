@@ -58,3 +58,42 @@ class UgprTableRow(BaseModel):
 
 class UgprTableOut(BaseModel):
     rows: list[UgprTableRow]
+
+
+class SalesKPIOut(BaseModel):
+    project_id: int
+    date_from: dt.date
+    date_to: dt.date
+    plan_m2: float
+    fact_m2: float
+    sold_m2: float
+    remaining_m2: float
+    variance_m2: float
+    progress_pct: float
+
+
+class FloorSummaryRow(BaseModel):
+    block: str | None = None
+    floor: str
+    progress_pct: float
+    operations_count: int
+
+
+class FloorSummaryOut(BaseModel):
+    rows: list[FloorSummaryRow]
+
+
+class FloorOperationRow(BaseModel):
+    operation_code: str
+    operation_name: str
+    progress_pct: float
+
+
+class FloorOperationOut(BaseModel):
+    rows: list[FloorOperationRow]
+
+
+class FloorSeriesOut(BaseModel):
+    plan: list[SeriesPoint]
+    fact: list[SeriesPoint]
+    forecast: list[SeriesPoint] | None = None

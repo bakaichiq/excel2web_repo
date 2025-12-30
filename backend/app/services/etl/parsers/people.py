@@ -4,7 +4,11 @@ from app.services.etl.validators import ValidationError
 
 def parse_people_tech(path: str, sheet: str = "Люди техника") -> tuple[pd.DataFrame, list[ValidationError]]:
     errors: list[ValidationError]=[]
-    df = pd.read_excel(path, sheet_name=sheet, header=0, engine="openpyxl")
+    try:
+        df = pd.read_excel(path, sheet_name=sheet, header=0, engine="openpyxl")
+    except ValueError:
+        errors.append(ValidationError(f"Не найден лист '{sheet}'", sheet=sheet))
+        return pd.DataFrame(), errors
     df.columns=[str(c).strip() if c is not None else "" for c in df.columns]
 
     base_cols=["наименование","категория","ед. изм","план/факт"]

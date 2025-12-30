@@ -6,6 +6,7 @@ import re
 from typing import Any, Optional
 
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert
 
 from app.core.config import settings
@@ -23,12 +24,14 @@ from app.db.models.operation import Operation
 from app.db.models.wbs import WBS
 from app.db.models.resource import Resource
 from app.db.models.fin_account import FinAccount
+from app.db.models.sales import SalesMonthly
 
 from app.services.etl.validators import ValidationError
 from app.services.etl.parsers.vdc import parse_vdc
 from app.services.etl.parsers.gpr import parse_gpr
 from app.services.etl.parsers.people import parse_people_tech
 from app.services.etl.parsers.finance import parse_bdr, parse_bdds
+from app.services.etl.parsers.sales import parse_sales
 
 
 # -----------------------------
@@ -88,6 +91,13 @@ def _table_cols(model) -> set[str]:
 def _filter_values(model, values: dict) -> dict:
     cols = _table_cols(model)
     return {k: v for k, v in values.items() if k in cols}
+
+
+def _has_index(db: Session, index_name: str) -> bool:
+    return db.execute(
+        text("select 1 from pg_indexes where indexname=:name limit 1"),
+        {"name": index_name},
+    ).scalar() is not None
 
 
 # -----------------------------
@@ -177,6 +187,7 @@ def _cleanup_imported(db: Session, project_id: int, import_run_id: int) -> None:
         FactPnLMonthly,
         FactCashflowMonthly,
         BaselineVolume,
+        SalesMonthly,
     ):
         db.query(model).filter(
             model.project_id == project_id,
@@ -335,6 +346,7 @@ def _load_plan_monthly(db: Session, project_id: int, import_run_id: int, gpr_df)
     cols = _table_cols(PlanVolumeMonthly)
     has_import_run = "import_run_id" in cols
     has_scenario = "scenario" in cols
+    supports_versions = _has_index(db, "uq_plan_volume_month_run")
 
     inserted = 0
     for (code, m), q in agg.items():
@@ -360,7 +372,23 @@ def _load_plan_monthly(db: Session, project_id: int, import_run_id: int, gpr_df)
             amount=None,  # если колонки нет — отфильтруется
         )
         values = _filter_values(PlanVolumeMonthly, values)
-        db.execute(insert(PlanVolumeMonthly.__table__).values(**values))
+        if supports_versions:
+            db.execute(insert(PlanVolumeMonthly.__table__).values(**values))
+        else:
+            existing = db.query(PlanVolumeMonthly).filter(
+                PlanVolumeMonthly.project_id == project_id,
+                PlanVolumeMonthly.operation_code == code,
+                PlanVolumeMonthly.month == m,
+                (PlanVolumeMonthly.scenario == "plan") if has_scenario else True,
+            ).first()
+            if existing:
+                if existing.import_run_id is None:
+                    continue
+                existing.import_run_id = import_run_id
+                existing.qty = values.get("qty")
+                existing.amount = values.get("amount")
+            else:
+                db.add(PlanVolumeMonthly(**values))
         inserted += 1
 
     db.commit()
@@ -368,46 +396,90 @@ def _load_plan_monthly(db: Session, project_id: int, import_run_id: int, gpr_df)
 
 
 def _load_baseline(db: Session, project_id: int, import_run_id: int, baseline_df) -> int:
-    n = 0
+    supports_versions = _has_index(db, "uq_baseline_row_run")
+    agg: dict[tuple[str | None, str | None, str | None], dict[str, Any]] = {}
+
     for _, r in baseline_df.iterrows():
         unit = normalize_unit(r.get("unit")) or _trunc(r.get("unit"), 32)
-
-        stmt = (
-            insert(BaselineVolume)
-            .values(
-                project_id=project_id,
-                import_run_id=import_run_id,
-                operation_code=_trunc(r.get("operation_code"), 128),
-                operation_name=_trunc(r.get("operation_name"), 512),
-                wbs=_trunc(r.get("wbs"), 512),
-                discipline=_trunc(r.get("discipline"), 128),
-                block=_trunc(r.get("block"), 128),
-                floor=_trunc(r.get("floor"), 64),
-                ugpr=_trunc(r.get("ugpr"), 128),
-                category=_trunc(r.get("category"), 128),
-                item_name=_trunc(r.get("item_name"), 512),
-                unit=_trunc(unit, 32),
-                plan_qty_total=_to_float_nullable(r.get("plan_qty_total")),
-                price=_to_float_nullable(r.get("price")),
-                amount_total=_to_float_nullable(r.get("amount_total")),
-            )
-            .on_conflict_do_update(
-                index_elements=[
-                    BaselineVolume.project_id,
-                    BaselineVolume.import_run_id,
-                    BaselineVolume.operation_code,
-                    BaselineVolume.category,
-                    BaselineVolume.item_name,
-                ],
-                index_where=BaselineVolume.import_run_id.isnot(None),
-                set_=dict(
-                    plan_qty_total=_to_float_nullable(r.get("plan_qty_total")),
-                    price=_to_float_nullable(r.get("price")),
-                    amount_total=_to_float_nullable(r.get("amount_total")),
-                ),
-            )
+        values = dict(
+            project_id=project_id,
+            import_run_id=import_run_id,
+            operation_code=_trunc(r.get("operation_code"), 128),
+            operation_name=_trunc(r.get("operation_name"), 512),
+            wbs=_trunc(r.get("wbs"), 512),
+            discipline=_trunc(r.get("discipline"), 128),
+            block=_trunc(r.get("block"), 128),
+            floor=_trunc(r.get("floor"), 64),
+            ugpr=_trunc(r.get("ugpr"), 128),
+            category=_trunc(r.get("category"), 128),
+            item_name=_trunc(r.get("item_name"), 512),
+            unit=_trunc(unit, 32),
+            plan_qty_total=_to_float_nullable(r.get("plan_qty_total")),
+            price=_to_float_nullable(r.get("price")),
+            amount_total=_to_float_nullable(r.get("amount_total")),
         )
-        db.execute(stmt)
+        key = (values.get("operation_code"), values.get("category"), values.get("item_name"))
+        if key not in agg:
+            agg[key] = values
+            continue
+
+        cur = agg[key]
+        for f in ("operation_name", "wbs", "discipline", "block", "floor", "ugpr", "unit"):
+            if values.get(f) not in (None, ""):
+                cur[f] = values.get(f)
+        if values.get("plan_qty_total") is not None:
+            cur["plan_qty_total"] = (cur.get("plan_qty_total") or 0.0) + float(values.get("plan_qty_total") or 0.0)
+        if values.get("amount_total") is not None:
+            cur["amount_total"] = (cur.get("amount_total") or 0.0) + float(values.get("amount_total") or 0.0)
+        if values.get("price") is not None:
+            cur["price"] = values.get("price")
+
+    n = 0
+    for values in agg.values():
+        if supports_versions:
+            stmt = (
+                insert(BaselineVolume)
+                .values(**values)
+                .on_conflict_do_update(
+                    index_elements=[
+                        BaselineVolume.project_id,
+                        BaselineVolume.import_run_id,
+                        BaselineVolume.operation_code,
+                        BaselineVolume.category,
+                        BaselineVolume.item_name,
+                    ],
+                    index_where=BaselineVolume.import_run_id.isnot(None),
+                    set_=dict(
+                        plan_qty_total=values.get("plan_qty_total"),
+                        price=values.get("price"),
+                        amount_total=values.get("amount_total"),
+                    ),
+                )
+            )
+            db.execute(stmt)
+        else:
+            existing = db.query(BaselineVolume).filter(
+                BaselineVolume.project_id == project_id,
+                BaselineVolume.operation_code == values.get("operation_code"),
+                BaselineVolume.category == values.get("category"),
+                BaselineVolume.item_name == values.get("item_name"),
+            ).first()
+            if existing:
+                if existing.import_run_id is None:
+                    continue
+                existing.import_run_id = import_run_id
+                existing.operation_name = values.get("operation_name")
+                existing.wbs = values.get("wbs")
+                existing.discipline = values.get("discipline")
+                existing.block = values.get("block")
+                existing.floor = values.get("floor")
+                existing.ugpr = values.get("ugpr")
+                existing.unit = values.get("unit")
+                existing.plan_qty_total = values.get("plan_qty_total")
+                existing.price = values.get("price")
+                existing.amount_total = values.get("amount_total")
+            else:
+                db.add(BaselineVolume(**values))
         n += 1
 
     db.commit()
@@ -416,45 +488,72 @@ def _load_baseline(db: Session, project_id: int, import_run_id: int, baseline_df
 
 def _load_fact_volume(db: Session, project_id: int, import_run_id: int, fact_df) -> int:
     n = 0
+    supports_versions = _has_index(db, "uq_fact_volume_day_run")
     for _, r in fact_df.iterrows():
         unit = normalize_unit(r.get("unit")) or _trunc(r.get("unit"), 32)
 
-        stmt = (
-            insert(FactVolumeDaily)
-            .values(
-                project_id=project_id,
-                import_run_id=import_run_id,
-                operation_code=_trunc(r.get("operation_code"), 128),
-                operation_name=_trunc(r.get("operation_name"), 512),
-                wbs=_trunc(r.get("wbs"), 512),
-                discipline=_trunc(r.get("discipline"), 128),
-                block=_trunc(r.get("block"), 128),
-                floor=_trunc(r.get("floor"), 64),
-                ugpr=_trunc(r.get("ugpr"), 128),
-                category=_trunc(r.get("category"), 128),
-                item_name=_trunc(r.get("item_name"), 512),
-                unit=_trunc(unit, 32),
-                date=normalize_date(r.get("date")) or r.get("date"),
-                qty=_to_float(r.get("qty"), 0.0),
-                amount=_to_float_nullable(r.get("amount")),
-            )
-            .on_conflict_do_update(
-                index_elements=[
-                    FactVolumeDaily.project_id,
-                    FactVolumeDaily.import_run_id,
-                    FactVolumeDaily.operation_code,
-                    FactVolumeDaily.category,
-                    FactVolumeDaily.item_name,
-                    FactVolumeDaily.date,
-                ],
-                index_where=FactVolumeDaily.import_run_id.isnot(None),
-                set_=dict(
-                    qty=_to_float(r.get("qty"), 0.0),
-                    amount=_to_float_nullable(r.get("amount")),
-                ),
-            )
+        values = dict(
+            project_id=project_id,
+            import_run_id=import_run_id,
+            operation_code=_trunc(r.get("operation_code"), 128),
+            operation_name=_trunc(r.get("operation_name"), 512),
+            wbs=_trunc(r.get("wbs"), 512),
+            discipline=_trunc(r.get("discipline"), 128),
+            block=_trunc(r.get("block"), 128),
+            floor=_trunc(r.get("floor"), 64),
+            ugpr=_trunc(r.get("ugpr"), 128),
+            category=_trunc(r.get("category"), 128),
+            item_name=_trunc(r.get("item_name"), 512),
+            unit=_trunc(unit, 32),
+            date=normalize_date(r.get("date")) or r.get("date"),
+            qty=_to_float(r.get("qty"), 0.0),
+            amount=_to_float_nullable(r.get("amount")),
         )
-        db.execute(stmt)
+
+        if supports_versions:
+            stmt = (
+                insert(FactVolumeDaily)
+                .values(**values)
+                .on_conflict_do_update(
+                    index_elements=[
+                        FactVolumeDaily.project_id,
+                        FactVolumeDaily.import_run_id,
+                        FactVolumeDaily.operation_code,
+                        FactVolumeDaily.category,
+                        FactVolumeDaily.item_name,
+                        FactVolumeDaily.date,
+                    ],
+                    index_where=FactVolumeDaily.import_run_id.isnot(None),
+                    set_=dict(
+                        qty=values.get("qty"),
+                        amount=values.get("amount"),
+                    ),
+                )
+            )
+            db.execute(stmt)
+        else:
+            existing = db.query(FactVolumeDaily).filter(
+                FactVolumeDaily.project_id == project_id,
+                FactVolumeDaily.operation_code == values.get("operation_code"),
+                FactVolumeDaily.category == values.get("category"),
+                FactVolumeDaily.item_name == values.get("item_name"),
+                FactVolumeDaily.date == values.get("date"),
+            ).first()
+            if existing:
+                if existing.import_run_id is None:
+                    continue
+                existing.import_run_id = import_run_id
+                existing.operation_name = values.get("operation_name")
+                existing.wbs = values.get("wbs")
+                existing.discipline = values.get("discipline")
+                existing.block = values.get("block")
+                existing.floor = values.get("floor")
+                existing.ugpr = values.get("ugpr")
+                existing.unit = values.get("unit")
+                existing.qty = values.get("qty")
+                existing.amount = values.get("amount")
+            else:
+                db.add(FactVolumeDaily(**values))
         n += 1
 
     db.commit()
@@ -542,6 +641,7 @@ def _load_manhours(db: Session, project_id: int, import_run_id: int, people_df) 
     has_import_run = "import_run_id" in cols_db
     has_manhours = "manhours" in cols_db
 
+    supports_versions = _has_index(db, "uq_res_day_run")
     n = 0
     for _, r in people_df.iterrows():
         qty = _to_float(r.get("qty"), 0.0)
@@ -567,28 +667,44 @@ def _load_manhours(db: Session, project_id: int, import_run_id: int, people_df) 
 
         values = _filter_values(FactResourceDaily, values)
 
-        # если у тебя есть uq_res_day — оставляем upsert по constraint
-        # если constraint нет — скажешь, и я сделаю тут безопасный fallback как в plan_monthly
-        stmt = (
-            insert(FactResourceDaily)
-            .values(**values)
-            .on_conflict_do_update(
-                index_elements=[
-                    FactResourceDaily.project_id,
-                    FactResourceDaily.import_run_id,
-                    FactResourceDaily.resource_name,
-                    FactResourceDaily.category,
-                    FactResourceDaily.date,
-                    FactResourceDaily.scenario,
-                ],
-                index_where=FactResourceDaily.import_run_id.isnot(None),
-                set_=dict(
-                    qty=values.get("qty"),
-                    manhours=values.get("manhours"),
-                ),
+        if supports_versions:
+            stmt = (
+                insert(FactResourceDaily)
+                .values(**values)
+                .on_conflict_do_update(
+                    index_elements=[
+                        FactResourceDaily.project_id,
+                        FactResourceDaily.import_run_id,
+                        FactResourceDaily.resource_name,
+                        FactResourceDaily.category,
+                        FactResourceDaily.date,
+                        FactResourceDaily.scenario,
+                    ],
+                    index_where=FactResourceDaily.import_run_id.isnot(None),
+                    set_=dict(
+                        qty=values.get("qty"),
+                        manhours=values.get("manhours"),
+                    ),
+                )
             )
-        )
-        db.execute(stmt)
+            db.execute(stmt)
+        else:
+            existing = db.query(FactResourceDaily).filter(
+                FactResourceDaily.project_id == project_id,
+                FactResourceDaily.resource_name == values.get("resource_name"),
+                FactResourceDaily.category == values.get("category"),
+                FactResourceDaily.date == values.get("date"),
+                FactResourceDaily.scenario == values.get("scenario"),
+            ).first()
+            if existing:
+                if existing.import_run_id is None:
+                    continue
+                existing.import_run_id = import_run_id
+                existing.qty = values.get("qty")
+                if has_manhours:
+                    existing.manhours = values.get("manhours")
+            else:
+                db.add(FactResourceDaily(**values))
         n += 1
 
     db.commit()
@@ -771,6 +887,61 @@ def _load_bdds(db: Session, project_id: int, import_run_id: int, bdds_df) -> int
     return inserted
 
 
+def _load_sales_monthly(db: Session, project_id: int, import_run_id: int, sales_df) -> int:
+    if sales_df.empty:
+        return 0
+
+    cols_db = _table_cols(SalesMonthly)
+    has_import_run = "import_run_id" in cols_db
+
+    agg: dict[tuple[str, dt.date, str], float] = {}
+
+    for _, r in sales_df.iterrows():
+        item = _trunc(r.get("item_name"), 256)
+        if not item:
+            continue
+
+        month = normalize_date(r.get("month")) or r.get("month")
+        if not isinstance(month, dt.date):
+            continue
+
+        scenario = _trunc(r.get("scenario") or "plan", 16) or "plan"
+        area = _to_float(r.get("area_m2"), 0.0)
+        key = (item, month, scenario)
+        agg[key] = float(agg.get(key, 0.0)) + area
+
+    inserted = 0
+    for (item, month, scenario), area in agg.items():
+        if has_import_run:
+            manual = db.query(SalesMonthly).filter(
+                SalesMonthly.project_id == project_id,
+                SalesMonthly.item_name == item,
+                SalesMonthly.month == month,
+                SalesMonthly.scenario == scenario,
+                SalesMonthly.import_run_id.is_(None),
+            ).first()
+            if manual is not None:
+                continue
+
+        values = dict(
+            project_id=project_id,
+            import_run_id=import_run_id,
+            item_name=item,
+            month=month,
+            scenario=scenario,
+            area_m2=float(area),
+        )
+        if not has_import_run:
+            values.pop("import_run_id", None)
+
+        values = _filter_values(SalesMonthly, values)
+        db.execute(insert(SalesMonthly.__table__).values(**values))
+        inserted += 1
+
+    db.commit()
+    return inserted
+
+
 def run_import(db: Session, run: ImportRun) -> tuple[list[ValidationError], int]:
     """Main import. Returns (errors, rows_loaded)."""
     errors: list[ValidationError] = []
@@ -788,12 +959,14 @@ def run_import(db: Session, run: ImportRun) -> tuple[list[ValidationError], int]
     people_df, e3 = parse_people_tech(str(path))
     bdr_df, e4 = parse_bdr(str(path))
     bdds_df, e5 = parse_bdds(str(path))
+    sales_df, e6 = parse_sales(str(path))
 
     errors.extend(e1)
     errors.extend(e2)
     errors.extend(e3)
     errors.extend(e4)
     errors.extend(e5)
+    errors.extend(e6)
 
     # Upsert dims first
     if not gpr_df.empty:
@@ -812,5 +985,7 @@ def run_import(db: Session, run: ImportRun) -> tuple[list[ValidationError], int]
         rows_loaded += _load_bdr(db, run.project_id, run.id, bdr_df)
     if not bdds_df.empty:
         rows_loaded += _load_bdds(db, run.project_id, run.id, bdds_df)
+    if not sales_df.empty:
+        rows_loaded += _load_sales_monthly(db, run.project_id, run.id, sales_df)
 
     return errors, rows_loaded
